@@ -1,0 +1,62 @@
+# ============================================================
+# Anlord Abliterator - LLM Abliteration & Benchmarking
+# Requirements for running the complete pipeline
+# ============================================================
+
+# Core ML Framework
+torch>=2.2.0
+torchvision>=0.17.0
+accelerate>=1.0.0
+
+# Transformers & Tokenizers
+transformers[kernels]>=4.46.0
+
+# Heretic - Abliteration Library
+heretic-llm>=1.4.0,<2.0
+
+# LM Evaluation Harness - Benchmarking
+lm-eval[hf]>=0.4.9,<0.5
+
+# HuggingFace Hub
+huggingface-hub>=0.24.0
+
+# BitsAndBytes - Quantization Support
+bitsandbytes>=0.44.0
+
+# PEFT - LoRA Support
+peft>=0.13.0
+
+# Optuna - Hyperparameter Optimization
+optuna>=4.0.0
+
+# Data Processing
+numpy>=1.24.0
+datasets>=2.18.0
+
+# Utilities
+tqdm>=4.66.0
+psutil>=5.9.0
+py-cpuinfo>=9.0.0
+rich>=13.7.0
+questionary>=2.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+tomli-w>=1.0.0
+
+# Hardware Monitoring
+nvidia-ml-py>=12.0.0
+
+# HTTP stack (avoid unsupported chardet 6.x combinations in requests)
+requests>=2.32.0,<3.0
+chardet>=5.0.0,<6.0
+
+# Optional: Research/Visualization
+# geom-median>=0.1
+# imageio>=2.37
+# matplotlib>=3.10
+# pacmap>=0.8
+# scikit-learn>=1.7
+
+# Development
+# ruff>=0.14.5
+# ty>=0.0.5

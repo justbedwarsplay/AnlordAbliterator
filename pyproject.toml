@@ -1,0 +1,81 @@
+[project]
+name = "anlord"
+version = "1.0.0"
+description = "Anlord Abliterator — automated LLM abliteration and evaluation"
+readme = "README.md"
+license = {text = "AGPL-3.0-or-later"}
+authors = [
+    { name = "Anlord Abliterator Development Team" }
+]
+requires-python = ">=3.10"
+keywords = ["llm", "abliteration", "benchmark", "evaluation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: GPU",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "accelerate>=1.0.0",
+    "transformers[kernels]>=4.46.0",
+    "heretic-llm>=1.4.0,<2.0",
+    "huggingface-hub>=0.24.0",
+    "bitsandbytes>=0.44.0",
+    "peft>=0.13.0",
+    "optuna>=4.0.0",
+    "numpy>=1.24.0",
+    "datasets>=2.18.0",
+    "tqdm>=4.66.0",
+    "psutil>=5.9.0",
+    "py-cpuinfo>=9.0.0",
+    "rich>=13.7.0",
+    "questionary>=2.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "tomli-w>=1.0.0",
+    "nvidia-ml-py>=12.0.0",
+    "requests>=2.32.0,<3.0",
+    "chardet>=5.0.0,<6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.14.5",
+    "pytest>=7.0.0",
+]
+lmeval = [
+    "lm-eval[hf]>=0.4.9,<0.5",
+]
+native = [
+    "datasets>=2.18.0",
+]
+
+[project.scripts]
+anlord = "anlord.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
