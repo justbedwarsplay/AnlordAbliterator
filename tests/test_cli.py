@@ -30,11 +30,14 @@ def test_cli_uses_default_benchmarks_and_quick_limit():
     args = create_parser().parse_args(["--model", "example/model"])
     settings = run_from_args(args)
 
+    # Default benchmarks are the 6 classic tasks when no --tasks is given
     assert len(settings.benchmarks) == 6
+    assert set(settings.benchmarks) == {"mmlu", "gsm8k", "hellaswag", "arc_challenge", "winogrande", "truthfulqa"}
     assert settings.limit == 100
     assert settings.prefetch_model is True
     assert settings.quantization == "auto"
-    assert settings.heretic_timeout == 43200
+    assert settings.abliteration_timeout == 43200
+    assert settings.abliteration_backend == "native"
 
 
 def test_model_prefetch_can_be_disabled():
@@ -51,10 +54,9 @@ def test_full_mode_has_no_implicit_limit():
     assert run_from_args(args).limit is None
 
 
-def test_heretic_reuse_ignores_benchmark_limit(tmp_path):
+def test_abliteration_reuse_ignores_benchmark_limit(tmp_path):
     from anlord.config import Settings
-    from anlord.evaluation.evaluator import EvaluationResult
-    from anlord.heretic.wrapper import HereticResult
+    from anlord.evaluation.evaluator import AbliterationResult, EvaluationResult
     from anlord.pipeline import AbliterationPipeline
 
     settings = Settings(
@@ -72,7 +74,7 @@ def test_heretic_reuse_ignores_benchmark_limit(tmp_path):
     existing = EvaluationResult(
         model_id="ornith-ai/Ornith-1.5-9B",
         evaluation_type="baseline",
-        heretic=HereticResult(model_id="ornith-ai/Ornith-1.5-9B", initial_refusals=90),
+        abliteration=AbliterationResult(model_id="ornith-ai/Ornith-1.5-9B", initial_refusals=90),
         config={
             "benchmarks": settings.benchmarks,
             "num_fewshot": 0,
@@ -87,13 +89,13 @@ def test_heretic_reuse_ignores_benchmark_limit(tmp_path):
         },
     )
 
-    assert existing.heretic_succeeded()
-    assert pipeline._baseline_heretic_matches(existing)
+    assert existing.abliteration_succeeded()
+    assert pipeline._baseline_abliteration_matches(existing)
     assert pipeline._baseline_matches_current_run(existing) is False
-    assert pipeline._heretic_result_to_reuse(existing) is existing.heretic
+    assert pipeline._abliteration_result_to_reuse(existing) is existing.abliteration
 
 
-def test_heretic_reuse_reads_standalone_metrics_file(tmp_path):
+def test_abliteration_reuse_reads_standalone_metrics_file(tmp_path):
     from anlord.config import Settings
     from anlord.pipeline import AbliterationPipeline
 
@@ -102,16 +104,16 @@ def test_heretic_reuse_reads_standalone_metrics_file(tmp_path):
         output_dir=tmp_path,
         cache_dir=tmp_path / "cache",
     )
-    metrics_dir = settings.get_models_dir() / "heretic_baseline"
+    metrics_dir = settings.get_models_dir() / "abliteration_baseline"
     metrics_dir.mkdir(parents=True)
-    (metrics_dir / "heretic_evaluation.json").write_text(
+    (metrics_dir / "abliteration_evaluation.json").write_text(
         '{"model": "ornith-ai/Ornith-1.5-9B", "initial_refusals": 88, "final_refusals": 88, "total_prompts": 100}',
         encoding="utf-8",
     )
     pipeline = object.__new__(AbliterationPipeline)
     pipeline.settings = settings
 
-    reused = pipeline._heretic_result_to_reuse(None)
+    reused = pipeline._abliteration_result_to_reuse(None)
 
     assert reused is not None
     assert reused.initial_refusals == 88

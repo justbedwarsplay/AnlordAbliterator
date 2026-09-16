@@ -2,7 +2,7 @@
 """
 Anlord Abliterator
 
-Automated LLM abliteration with Heretic, followed by evaluation,
+Automated LLM abliteration followed by evaluation,
 benchmarking, comparison, and report generation.
 """
 

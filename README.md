@@ -4,16 +4,15 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" />
   <img src="https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" />
   <img src="https://img.shields.io/badge/CUDA-11.8%20%2F%2012.x-76B900?style=for-the-badge&logo=nvidia&logoColor=white" />
-  <img src="https://img.shields.io/badge/Heretic-1.4%2B-8A2BE2?style=for-the-badge" />
   <img src="https://img.shields.io/badge/License-AGPL--3.0-00A86B?style=for-the-badge" />
 </p>
 
 <p align="center">
-  <strong>Automated LLM abliteration with <a href="https://github.com/p-e-w/heretic">Heretic</a>. Honest before/after evaluation. Beautiful reports.</strong>
+  <strong>Automated LLM abliteration. Honest before/after evaluation. Beautiful reports.</strong>
 </p>
 
 <p align="center">
-  Download with progress → Baseline benchmarks → Heretic optimization → Merge LoRA → Re-evaluate → Compare → HTML / JSON / CSV
+  Download with progress → Baseline benchmarks → Abliteration → Merge LoRA → Re-evaluate → Compare → HTML / JSON / CSV
 </p>
 
 <p align="center">
@@ -31,7 +30,7 @@
 
 | | What it does |
 |---|---|
-| **🔧 Heretic-native** | Calls `heretic.main:main` as a subprocess. Optuna search over refusal direction & layer weights, Pareto selection (`refusals ↓` + `KL ↓`), merges LoRA into base model |
+| **🔧 Native abliteration** | In-process Optuna search over refusal direction & layer weights, Pareto selection (`refusals ↓` + `KL ↓`), merges LoRA into base model |
 | **⬇️ Visible downloads** | `huggingface_hub.snapshot_download` with progress bars into `cache/hub` |
 | **🔐 Ephemeral HF auth** | Optional `HF_TOKEN` kept only in the current process (`questionary` masked prompt). `Enter` = anonymous. `--no-hf-token-prompt` for CI |
 | **📊 Native runner (default)** | Custom evaluators on `datasets` + `transformers` — no `lm-eval` required, works offline, tolerant to `trust_remote_code` deprecation |
@@ -39,10 +38,10 @@
 | **⚖️ Before → After** | Same benchmarks run on baseline and abliterated models, `comparison.json` with deltas |
 | **💻 Hardware-aware** | `psutil` + `pynvml` monitoring. `HardwarePlanner` auto-selects load-time `quantization` / `device_map` / `max_memory` / `batch_size` for your GPU (see note below) |
 | **📝 Reports** | Interactive `report.html` + `report.json` + `report.csv` + per-benchmark `*.json` |
-| **🔄 Resume** | `--resume` (on by default) — skips completed Heretic + benchmark shards by `model_id + config` hash. Corrupted `*.tmp` files are ignored |
+| **🔄 Resume** | `--resume` (on by default) — skips completed abliteration + benchmark shards by `model_id + config` hash. Corrupted `*.tmp` files are ignored |
 | **🪟 Windows-first** | `questionary` + `rich` prompts, no `curses`, handles `triton-windows` / `causal-conv1d` gracefully |
 
-> **Note on `--quantization`:** this flag in AnlordAbliterator controls only **how the model is loaded into memory** during abliteration/evaluation (VRAM saving via `bitsandbytes` + CPU offload). It does **not** quantize the saved abliterated model — the output in `models/heretic_output/` is always full-precision `safetensors` (BF16/F16). For distribution quants (GGUF `Q4_K_M` etc.) see [GGUF Quantization](#gguf-quantization).
+> **Note on `--quantization`:** this flag in AnlordAbliterator controls only **how the model is loaded into memory** during abliteration/evaluation (VRAM saving via `bitsandbytes` + CPU offload). It does **not** quantize the saved abliterated model — the output in `models/abliterated/` is always full-precision `safetensors` (BF16/F16). For distribution quants (GGUF `Q4_K_M` etc.) see [GGUF Quantization](#gguf-quantization).
 
 ## Architecture
 
@@ -54,9 +53,9 @@ Hugging Face model (any causal LM)
         │
         ├─► Baseline benchmarks (optional) ──► results/baseline/*.json
         │
-        ▼ Heretic ── trials × (reset → abliterate → KL + refusal count)
+        ▼ Abliteration ── trials × (reset → abliterate → KL + refusal count)
         │              └─ Pareto front → best trial → merge LoRA
-        │                              └─► models/heretic_output/abliterated-{ns}/
+        │                              └─► models/abliterated/
         │
         ├─► Abliterated benchmarks ──► results/abliterated/*.json
         │
@@ -65,14 +64,14 @@ Hugging Face model (any causal LM)
         ▼ Reports ──► reports/report.{html,json,csv}
 ```
 
-Works with any Heretic-supported architecture (Qwen, Llama, Mistral, Gemma, etc.).
+Works with any supported architecture (Qwen, Llama, Mistral, Gemma, etc.).
 
 ## Requirements
 
 - Python 3.10+
 - PyTorch 2.2+ with CUDA 11.8/12.x recommended (CPU also works)
 - 16GB+ RAM; 8GB VRAM is enough for 0.8B–7B models (larger models auto-use load-time `bnb_4bit` + CPU offload)
-- `transformers>=4.46`, `heretic-llm>=1.4`, `datasets>=2.18`, `accelerate`, `bitsandbytes`, `peft`, `optuna`
+- `transformers>=4.46`, `datasets>=2.18`, `accelerate`, `bitsandbytes`, `peft`, `optuna`
 
 See `pyproject.toml` / `requirements.txt` for the full list.
 
@@ -190,16 +189,20 @@ Model:
 Auth:
   --hf-token-prompt / --no-hf-token-prompt
 
-Heretic:
+Abliteration:
   --trials, -t           trials (default 100)
   --timeout              seconds (default 43200 = 12h)
   --eval-prompts         prompts for KL/refusal (default 100)
+  --backend              native | auto (default native)
+  --row-normalization    none | pre | full (default full)
+  --no-orthogonalize     disable projected abliteration
 
 Benchmarks:
   --tasks, --benchmarks, -b   see table above
   --mode                 quick | full
   --limit, -l            samples per benchmark (quick default 100)
   --num-fewshot          override few-shot
+  --native-benchmarks / --no-native-benchmarks  (default native)
 
 Hardware (load-time only, not saved):
   --dtype                auto | float16 | bfloat16 | float32
@@ -212,7 +215,11 @@ Hardware (load-time only, not saved):
 Pipeline:
   --skip-baseline --skip-abliteration --skip-benchmarks
   --resume / --no-resume
-  --baseline-evaluate    force a separate Heretic baseline pass
+  --baseline-evaluate    force a separate Abliteration baseline pass
+  --yes                  auto-confirm prompts (kept for compat)
+
+Reproducibility:
+  --seed, -s             random seed (default 42)
 
 Other:
   --info --verbose, -v --quiet, -q --log-file
@@ -224,14 +231,13 @@ Other:
 output/
 ├── cache/hub/                          # HF snapshot (safetensors + tokenizer)
 ├── models/
-│   ├── heretic_output/
-│   │   └── abliterated-{nanoseconds}/  # ← your merged model (ready to use)
-│   │       ├── config.json
-│   │       ├── tokenizer.json
-│   │       ├── model.safetensors (or shards)
-│   │       └── heretic_abliteration_metrics.json
-│   ├── heretic_study/                  # Optuna study (for resume)
-│   └── heretic_baseline/
+│   ├── abliterated/  # ← your merged model (ready to use)
+│   │   ├── config.json
+│   │   ├── tokenizer.json
+│   │   ├── model.safetensors (or shards)
+│   │   └── abliteration_metrics.json
+│   ├── abliteration_study/                  # Optuna study (for resume)
+│   └── abliteration_baseline/               # baseline metrics
 ├── results/
 │   ├── baseline/*.json
 │   ├── abliterated/*.json
@@ -249,8 +255,8 @@ The abliterated model is already merged (LoRA weights folded in). Load it direct
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
-model = AutoModelForCausalLM.from_pretrained("output/models/heretic_output/abliterated-123456", trust_remote_code=True, device_map="auto")
-tok = AutoTokenizer.from_pretrained("output/models/heretic_output/abliterated-123456", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained("output/models/abliterated", trust_remote_code=True, device_map="auto")
+tok = AutoTokenizer.from_pretrained("output/models/abliterated", trust_remote_code=True)
 ```
 
 ## GGUF Quantization
@@ -284,11 +290,10 @@ The default output is `model.safetensors` in BF16/F16 — no quantization, full 
 
 ## License
 
-AGPL-3.0-or-later. Heretic and each base model have their own licenses — respect them when redistributing abliterated weights.
+AGPL-3.0-or-later. Each base model has its own license — respect it when redistributing abliterated weights.
 
 ## Acknowledgments
 
-- [Heretic](https://github.com/p-e-w/heretic) — abliteration
 - [Hugging Face Transformers & Datasets](https://huggingface.co)
 - [EleutherAI lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) — optional
 

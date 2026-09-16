@@ -4,7 +4,7 @@ Anlord Abliterator
 Main entry point.
 """
 
-from anlord.cli.main import main
+from src.anlord.cli.main import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

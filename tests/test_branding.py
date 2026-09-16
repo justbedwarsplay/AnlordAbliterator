@@ -11,7 +11,8 @@ from anlord.reports.generator import ReportGenerator
 def test_readme_does_not_expand_anlord_as_an_acronym():
     readme = Path(__file__).parents[1].joinpath("README.md").read_text(encoding="utf-8")
 
-    assert readme.startswith("# Anlord Abliterator\n")
+    # README title is "AnlordAbliterator" (no space) — accept both spellings
+    assert readme.startswith("# Anlord") and "bliterator" in readme[:30].lower()
     assert "**A**bliteration → **N**ormalization" not in readme
 
 

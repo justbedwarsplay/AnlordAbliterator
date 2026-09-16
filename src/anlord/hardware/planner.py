@@ -16,14 +16,14 @@ _PARAM_COUNT = re.compile(r"(?i)(?:^|[^0-9])(\d+(?:\.\d+)?)[ _-]?b(?:illion)?(?:
 
 @dataclass(frozen=True)
 class LoadPlan:
-    """Resolved Heretic / Transformers load settings for the current host."""
+    """Resolved Abliteration / Transformers load settings for the current host."""
 
     quantization: str
     device_map: str
     max_memory: dict[str, str] | None
-    heretic_dtypes: list[str]
-    heretic_batch_size: int
-    heretic_max_batch_size: int
+    abliteration_dtypes: list[str]
+    abliteration_batch_size: int
+    abliteration_max_batch_size: int
     estimated_weight_gb: float
     estimated_load_gb: float
     available_vram_gb: float
@@ -33,8 +33,8 @@ class LoadPlan:
     warnings: list[str] = field(default_factory=list)
 
 
-def heretic_dtypes_for(dtype: str) -> list[str]:
-    """Return a Heretic dtype fallback list that will not escalate to float32."""
+def abliteration_dtypes_for(dtype: str) -> list[str]:
+    """Return a Abliteration dtype fallback list that will not escalate to float32."""
     if dtype == "auto":
         return ["auto", "bfloat16", "float16"]
     if dtype == "bfloat16":
@@ -44,8 +44,8 @@ def heretic_dtypes_for(dtype: str) -> list[str]:
     return [dtype]
 
 
-def heretic_device_map_for(device: str) -> str:
-    """Map a user device preference to a Heretic/Accelerate device_map."""
+def abliteration_device_map_for(device: str) -> str:
+    """Map a user device preference to a Abliteration/Accelerate device_map."""
     return "cpu" if device == "cpu" else "auto"
 
 
@@ -67,7 +67,7 @@ def estimated_resident_gb(weight_gb: float, quantization: str) -> float:
 
 
 def format_memory_budget(gigabytes: float) -> str:
-    """Format a Heretic ``max_memory`` entry."""
+    """Format a Abliteration ``max_memory`` entry."""
     rounded = max(1, int(gigabytes + 0.999))
     return f"{rounded}GB"
 
@@ -158,18 +158,18 @@ def plan_model_load(
             )
 
     if resolved == "bnb_8bit":
-        # Heretic only accepts none / bnb_4bit. Keep 8-bit for the caller if they
-        # asked for it, but the planner still reports a 4-bit Heretic fallback.
-        warnings.append("Heretic does not support bnb_8bit; it will use bnb_4bit")
+        # Abliteration only accepts none / bnb_4bit. Keep 8-bit for the caller if they
+        # asked for it, but the planner still reports a 4-bit Abliteration fallback.
+        warnings.append("Abliteration does not support bnb_8bit; it will use bnb_4bit")
 
-    heretic_quantization = "bnb_4bit" if resolved in {"bnb_4bit", "bnb_8bit"} else "none"
+    abliteration_quantization = "bnb_4bit" if resolved in {"bnb_4bit", "bnb_8bit"} else "none"
     if estimated_weight:
-        load_gb = estimated_resident_gb(estimated_weight, heretic_quantization)
+        load_gb = estimated_resident_gb(estimated_weight, abliteration_quantization)
     else:
         load_gb = 0.0
 
     four_bit_fits = (
-        heretic_quantization == "bnb_4bit" and load_gb > 0 and vram_gb > 0 and load_gb <= vram_gb * 0.9
+        abliteration_quantization == "bnb_4bit" and load_gb > 0 and vram_gb > 0 and load_gb <= vram_gb * 0.9
     )
     if four_bit_fits and device != "cpu":
         device_map = "cuda"
@@ -179,7 +179,7 @@ def plan_model_load(
             "so Accelerate cannot offload leftover modules to disk"
         )
     else:
-        device_map = heretic_device_map_for(device)
+        device_map = abliteration_device_map_for(device)
         max_memory = _max_memory(
             device=device,
             vram_gb=vram_gb,
@@ -187,7 +187,7 @@ def plan_model_load(
             available_ram_gb=available,
             commit_limit_gb=commit_limit,
             load_gb=load_gb,
-            quantization=heretic_quantization,
+            quantization=abliteration_quantization,
         )
         if device_map == "auto" and max_memory:
             if "cpu" in max_memory:
@@ -199,7 +199,7 @@ def plan_model_load(
         load_gb
         and commit_limit
         and load_gb > commit_limit * 0.9
-        and heretic_quantization == "bnb_4bit"
+        and abliteration_quantization == "bnb_4bit"
     ):
         warnings.append(
             f"Even 4-bit loading (~{load_gb:.1f} GB) is close to the Windows/Linux "
@@ -214,28 +214,28 @@ def plan_model_load(
         batch_size = 0
         max_batch_size = 64
         reasons.append(
-            f"Heretic batch size: auto (max {max_batch_size}) | weights {estimated_weight:.1f} GB, VRAM {vram_gb:.1f} GB"
+            f"Abliteration batch size: auto (max {max_batch_size}) | weights {estimated_weight:.1f} GB, VRAM {vram_gb:.1f} GB"
         )
     else:
         tight_gpu = device != "cpu" and 0 < vram_gb < 12
-        if tight_gpu or heretic_quantization == "bnb_4bit":
+        if tight_gpu or abliteration_quantization == "bnb_4bit":
             batch_size = 1
             max_batch_size = 1
-            reasons.append("Heretic batch size locked to 1 to reduce peak memory")
+            reasons.append("Abliteration batch size locked to 1 to reduce peak memory")
         else:
             batch_size = 0
             max_batch_size = 64
             reasons.append(
-                f"Heretic batch size: auto (max {max_batch_size}) | weights {estimated_weight:.1f} GB, VRAM {vram_gb:.1f} GB"
+                f"Abliteration batch size: auto (max {max_batch_size}) | weights {estimated_weight:.1f} GB, VRAM {vram_gb:.1f} GB"
             )
 
     return LoadPlan(
         quantization=resolved,
         device_map=device_map,
         max_memory=max_memory,
-        heretic_dtypes=heretic_dtypes_for(dtype),
-        heretic_batch_size=batch_size,
-        heretic_max_batch_size=max_batch_size,
+        abliteration_dtypes=abliteration_dtypes_for(dtype),
+        abliteration_batch_size=batch_size,
+        abliteration_max_batch_size=max_batch_size,
         estimated_weight_gb=estimated_weight,
         estimated_load_gb=load_gb,
         available_vram_gb=vram_gb,
@@ -456,11 +456,11 @@ def compact_process_error(output: str) -> str:
 
 
 def explain_model_load_failure(output: str, return_code: int) -> str:
-    """Turn a Heretic/Transformers crash into an actionable error."""
+    """Turn a Abliteration/Transformers crash into an actionable error."""
     compact = compact_process_error(output)
     if looks_like_access_violation(return_code, output):
         return (
-            "Heretic crashed with Windows access violation 0xC0000005 "
+            "Abliteration crashed with Windows access violation 0xC0000005 "
             f"(exit code {return_code}). "
             "On 8 GB laptops this usually means bitsandbytes ran out of RAM/VRAM "
             "while mapping a VL checkpoint (vision + text) or mixing 4-bit GPU "
@@ -472,7 +472,7 @@ def explain_model_load_failure(output: str, return_code: int) -> str:
         )
     if looks_like_meta_tensor_error(output) or looks_like_meta_tensor_error(compact):
         return (
-            "Heretic hit a meta-tensor error because Accelerate offloaded 4-bit "
+            "Abliteration hit a meta-tensor error because Accelerate offloaded 4-bit "
             "modules to disk. Anlord Abliterator retries with device_map=cuda and "
             "no max_memory so the whole 4-bit model stays on the GPU."
         )
@@ -485,7 +485,7 @@ def explain_model_load_failure(output: str, return_code: int) -> str:
     if looks_like_bnb_offload_error(output):
         return (
             "bitsandbytes refused to place 4-bit layers on CPU. Anlord Abliterator now "
-            "enables llm_int8_enable_fp32_cpu_offload in the Heretic bridge so leftover "
+            "enables llm_int8_enable_fp32_cpu_offload in the Abliteration bridge so leftover "
             "layers can sit in RAM/pagefile. Update and rerun with --no-resume."
         )
     if looks_like_oom_error(output):
@@ -496,8 +496,8 @@ def explain_model_load_failure(output: str, return_code: int) -> str:
             "and a large Windows pagefile."
         )
     if compact:
-        return f"Heretic exited with code {return_code}: {compact}"
-    return f"Heretic exited with code {return_code}"
+        return f"Abliteration exited with code {return_code}: {compact}"
+    return f"Abliteration exited with code {return_code}"
 
 
 def apply_plan_to_mapping(target: Mapping[str, object] | None, plan: LoadPlan) -> dict[str, object]:

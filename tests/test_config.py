@@ -24,8 +24,8 @@ class TestSettings:
 
         assert settings.model == "unsloth/gpt-oss-20b-BF16"
         assert settings.output_dir == Path("./output")
-        assert settings.heretic_trials == 100
-        assert settings.heretic_timeout == 43200
+        assert settings.abliteration_trials == 100
+        assert settings.abliteration_timeout == 43200
         assert settings.mode == RunMode.QUICK
         assert settings.seed == 42
         assert settings.quantization == "auto"
@@ -35,12 +35,12 @@ class TestSettings:
         """Test custom settings."""
         settings = Settings(
             model="Qwen/Qwen2.5-7B",
-            heretic_trials=200,
+            abliteration_trials=200,
             mode=RunMode.FULL,
         )
 
         assert settings.model == "Qwen/Qwen2.5-7B"
-        assert settings.heretic_trials == 200
+        assert settings.abliteration_trials == 200
         assert settings.mode == RunMode.FULL
 
     def test_benchmarks_parsing(self):

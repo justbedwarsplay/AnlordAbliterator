@@ -240,13 +240,13 @@ class InteractivePrompter:
             return 100
 
     def prompt_trials(self) -> int:
-        """Prompt for number of Heretic trials."""
+        """Prompt for number of Abliteration trials."""
         if self.use_fallback:
-            trials = self._input_fallback("Enter number of Heretic trials (default: 100)", "100")
+            trials = self._input_fallback("Enter number of Abliteration trials (default: 100)", "100")
             return int(trials) if trials.strip() else 100
 
         trials = questionary.text(
-            "Enter number of Heretic trials (default: 100):",
+            "Enter number of Abliteration trials (default: 100):",
             default="100",
             style=CUSTOM_STYLE,
         ).ask()
@@ -419,7 +419,7 @@ class InteractivePrompter:
         limit = self.prompt_limit(mode)
 
         # Trials
-        print("\nStep 6/8: Heretic Configuration")
+        print("\nStep 6/8: Abliteration Configuration")
         print("-" * 40)
         trials = self.prompt_trials()
 
@@ -442,7 +442,7 @@ class InteractivePrompter:
             benchmarks=benchmarks,
             mode=mode,
             limit=limit,
-            heretic_trials=trials,
+            abliteration_trials=trials,
             dtype=dtype,
             device=device,
             quantization=quantization,

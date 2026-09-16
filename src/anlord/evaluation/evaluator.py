@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -18,16 +18,70 @@ try:
 except ImportError:
     NativeBenchmarkRunner = None  # type: ignore
 
-from ..heretic.wrapper import HereticResult, HereticWrapper
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AbliterationResult:
+    """Results from abliteration evaluation and optimization."""
+
+    model_id: str
+    abliterated_model_path: Optional[str] = None
+    initial_refusals: int = 0
+    final_refusals: int = 0
+    total_prompts: int = 0
+    initial_refusal_rate: float = 0.0
+    final_refusal_rate: float = 0.0
+    kl_divergence: float = 0.0
+    trials: int = 0
+    best_trial: int = 0
+    evaluation_time_seconds: float = 0.0
+    abliteration_time_seconds: float = 0.0
+    total_time_seconds: float = 0.0
+    config: dict = field(default_factory=dict)
+    error: Optional[str] = None
+    warnings: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "model": self.model_id,
+            "model_id": self.model_id,
+            "abliterated_model": self.abliterated_model_path,
+            "abliterated_model_path": self.abliterated_model_path,
+            "initial_refusals": self.initial_refusals,
+            "final_refusals": self.final_refusals,
+            "total_prompts": self.total_prompts,
+            "initial_refusal_rate": self.initial_refusal_rate,
+            "final_refusal_rate": self.final_refusal_rate,
+            "kl_divergence": self.kl_divergence,
+            "trials": self.trials,
+            "best_trial": self.best_trial,
+            "evaluation_time_seconds": self.evaluation_time_seconds,
+            "abliteration_time_seconds": self.abliteration_time_seconds,
+            "total_time_seconds": self.total_time_seconds,
+            "config": self.config,
+            "error": self.error,
+            "warnings": self.warnings,
+        }
+
+    @staticmethod
+    def is_model_directory(path: Path | str) -> bool:
+        """Return whether *path* looks like a loadable HF model."""
+        path = Path(path)
+        if not path.is_dir():
+            return False
+        has_config = (path / "config.json").is_file()
+        has_adapter_config = (path / "adapter_config.json").is_file()
+        weight_patterns = ("*.safetensors", "*.bin", "*.pt", "*.pth")
+        has_weights = any(any(path.glob(pattern)) for pattern in weight_patterns)
+        return has_weights and (has_config or has_adapter_config)
 
 
 @dataclass
 class EvaluationResult:
     model_id: str
     evaluation_type: str
-    heretic: Optional[HereticResult] = None
+    abliteration: Optional[AbliterationResult] = None
     benchmarks: dict[str, BenchmarkResult] = field(default_factory=dict)
     peak_vram_gb: float = 0.0
     peak_ram_gb: float = 0.0
@@ -40,7 +94,7 @@ class EvaluationResult:
         return {
             "model_id": self.model_id,
             "evaluation_type": self.evaluation_type,
-            "heretic": self.heretic.to_dict() if self.heretic else None,
+            "abliteration": self.abliteration.to_dict() if self.abliteration else None,
             "benchmarks": {key: value.to_dict() for key, value in self.benchmarks.items()},
             "peak_vram_gb": self.peak_vram_gb,
             "peak_ram_gb": self.peak_ram_gb,
@@ -55,15 +109,15 @@ class EvaluationResult:
         return benchmark.primary_metric if benchmark else None
 
     def successful_for(self, benchmarks: list[str]) -> bool:
-        if self.error or self.heretic is None or self.heretic.error:
+        if self.error or self.abliteration is None or self.abliteration.error:
             return False
         return all(
             task_id in self.benchmarks and self.benchmarks[task_id].succeeded
             for task_id in benchmarks
         )
 
-    def heretic_succeeded(self) -> bool:
-        return self.heretic is not None and not self.heretic.error
+    def abliteration_succeeded(self) -> bool:
+        return self.abliteration is not None and not self.abliteration.error
 
 
 class BaselineEvaluator:
@@ -73,8 +127,8 @@ class BaselineEvaluator:
         self,
         model_id: str,
         output_dir: Path | str,
-        heretic_wrapper: Optional[HereticWrapper] = None,
-        heretic_output_dir: Path | str | None = None,
+        abliteration_wrapper: Optional[object] = None,
+        abliteration_output_dir: Path | str | None = None,
         dtype: str = "auto",
         device_map: str = "auto",
         device: str = "cuda",
@@ -84,8 +138,8 @@ class BaselineEvaluator:
         model_commit: str | None = None,
         cache_dir: Path | str | None = None,
         max_memory: dict | None = None,
-        heretic_batch_size: int | None = None,
-        heretic_max_batch_size: int | None = None,
+        abliteration_batch_size: int | None = None,
+        abliteration_max_batch_size: int | None = None,
         native_benchmarks: bool = True,
         **kwargs,
     ):
@@ -104,32 +158,14 @@ class BaselineEvaluator:
         self.cache_dir = Path(cache_dir).resolve() if cache_dir else None
         self.max_memory = max_memory
         self.native_benchmarks = native_benchmarks
-
-        if heretic_wrapper is None:
-            self.heretic = HereticWrapper(
-                model_id=model_id,
-                output_dir=heretic_output_dir or self.output_dir,
-                dtype=dtype,
-                device=device,
-                device_map=device_map,
-                quantization=quantization,
-                seed=seed,
-                model_commit=model_commit,
-                cache_dir=self.cache_dir,
-                max_memory=max_memory,
-                heretic_batch_size=heretic_batch_size,
-                heretic_max_batch_size=heretic_max_batch_size,
-                **kwargs,
-            )
-        else:
-            self.heretic = heretic_wrapper
+        # wrapper is no longer used; kept for compat
 
     def run_evaluation(
         self,
         benchmarks: list[str],
         num_fewshot: int = 0,
         limit: Optional[int] = None,
-        reuse_heretic: Optional[HereticResult] = None,
+        reuse_abliteration: Optional[AbliterationResult] = None,
     ) -> EvaluationResult:
         start_time = time.time()
         result = EvaluationResult(
@@ -154,37 +190,15 @@ class BaselineEvaluator:
         errors: list[str] = []
         logger.info("Starting baseline evaluation for %s", self.model_id)
 
-        if reuse_heretic is not None and not reuse_heretic.error:
-            logger.info("Reusing completed Heretic baseline evaluation")
-            result.heretic = reuse_heretic
+        if reuse_abliteration is not None and not reuse_abliteration.error:
+            logger.info("Reusing completed abliteration baseline evaluation")
+            result.abliteration = reuse_abliteration
         else:
-            logger.info("Running Heretic evaluation on original model...")
-            heretic_metrics = self.heretic.run_evaluation(model_path=None, save_results=True)
-            if heretic_metrics.get("error"):
-                errors.append(f"Heretic evaluation: {heretic_metrics['error']}")
-            else:
-                total_prompts = int(heretic_metrics.get("total_prompts", 0))
-                initial_refusals = int(heretic_metrics.get("initial_refusals", 0))
-                final_refusals = int(heretic_metrics.get("final_refusals", initial_refusals))
-                result.heretic = HereticResult(
-                    model_id=self.model_id,
-                    initial_refusals=initial_refusals,
-                    final_refusals=final_refusals,
-                    total_prompts=total_prompts,
-                    initial_refusal_rate=(
-                        initial_refusals / total_prompts if total_prompts else 0.0
-                    ),
-                    final_refusal_rate=(final_refusals / total_prompts if total_prompts else 0.0),
-                    kl_divergence=float(heretic_metrics.get("kl_divergence", 0.0)),
-                    evaluation_time_seconds=float(heretic_metrics.get("evaluation_time", 0.0)),
-                )
-
-        if errors:
-            result.duration_seconds = time.time() - start_time
-            result.error = "; ".join(errors)
-            self._save_results(result)
-            logger.error("Baseline refusal evaluation failed; benchmarks will not be started")
-            return result
+            # No separate abliteration evaluation by default; caller (pipeline) will synthesize from abliteration result.
+            # If baseline_evaluate was forced, pipeline would have called this with reuse=None and expects us to run benchmarks only.
+            # We create a placeholder with zero refusals; pipeline's _synthesize will fill it later.
+            logger.info("Baseline abliteration metrics deferred (will be synthesized from abliteration)")
+            # leave result.abliteration as None so pipeline can fill it
 
         if benchmarks:
             use_native = bool(self.native_benchmarks and NativeBenchmarkRunner is not None)
@@ -209,7 +223,7 @@ class BaselineEvaluator:
                 task_ids=benchmarks,
                 num_fewshot=num_fewshot,
                 limit=limit,
-                skip_existing=reuse_heretic is not None,
+                skip_existing=reuse_abliteration is not None,
                 save_results=True,
             )
             for benchmark in benchmark_results:
@@ -240,8 +254,8 @@ class BaselineEvaluator:
             return None
         try:
             data = json.loads(filepath.read_text(encoding="utf-8"))
-            heretic_data = data.get("heretic")
-            heretic_result = _load_heretic_result(heretic_data) if heretic_data else None
+            abliteration_data = data.get("abliteration")
+            abliteration_result = _load_abliteration_result(abliteration_data) if abliteration_data else None
             benchmarks = {
                 task_id: _load_benchmark_result(benchmark_data)
                 for task_id, benchmark_data in data.get("benchmarks", {}).items()
@@ -249,7 +263,7 @@ class BaselineEvaluator:
             return EvaluationResult(
                 model_id=data["model_id"],
                 evaluation_type=data["evaluation_type"],
-                heretic=heretic_result,
+                abliteration=abliteration_result,
                 benchmarks=benchmarks,
                 peak_vram_gb=data.get("peak_vram_gb", 0.0),
                 peak_ram_gb=data.get("peak_ram_gb", 0.0),
@@ -263,13 +277,13 @@ class BaselineEvaluator:
             return None
 
 
-def _load_heretic_result(data: dict) -> HereticResult:
+def _load_abliteration_result(data: dict) -> AbliterationResult:
     model_id = data.get("model") or data.get("model_id")
     if not model_id:
-        raise KeyError("heretic result is missing model id")
-    return HereticResult(
+        raise KeyError("abliteration result is missing model id")
+    return AbliterationResult(
         model_id=model_id,
-        abliterated_model_path=data.get("abliterated_model"),
+        abliterated_model_path=data.get("abliterated_model") or data.get("abliterated_model_path"),
         initial_refusals=data.get("initial_refusals", 0),
         final_refusals=data.get("final_refusals", 0),
         total_prompts=data.get("total_prompts", 0),
@@ -313,19 +327,19 @@ def compare_models(baseline: EvaluationResult, abliterated: EvaluationResult) ->
         "benchmark_changes": {},
         "summary": {},
     }
-    if baseline.heretic and abliterated.heretic:
+    if baseline.abliteration and abliterated.abliteration:
         comparison["refusal_change"] = {
             "initial_refusals": {
-                "baseline": baseline.heretic.initial_refusals,
-                "abliterated": abliterated.heretic.initial_refusals,
-                "delta": (abliterated.heretic.initial_refusals - baseline.heretic.initial_refusals),
+                "baseline": baseline.abliteration.initial_refusals,
+                "abliterated": abliterated.abliteration.initial_refusals,
+                "delta": (abliterated.abliteration.initial_refusals - baseline.abliteration.initial_refusals),
             },
             "final_refusals": {
-                "baseline": baseline.heretic.final_refusals,
-                "abliterated": abliterated.heretic.final_refusals,
-                "delta": (abliterated.heretic.final_refusals - baseline.heretic.final_refusals),
+                "baseline": baseline.abliteration.final_refusals,
+                "abliterated": abliterated.abliteration.final_refusals,
+                "delta": (abliterated.abliteration.final_refusals - baseline.abliteration.final_refusals),
             },
-            "kl_divergence": abliterated.heretic.kl_divergence,
+            "kl_divergence": abliterated.abliteration.kl_divergence,
         }
     for task_id in set(baseline.benchmarks) & set(abliterated.benchmarks):
         baseline_score = baseline.benchmarks[task_id].primary_metric

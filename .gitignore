@@ -1,0 +1,23 @@
+# HF caches (runtime)
+cache/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+# Outputs
+output/
+results/
+reports/
+models/
+# IDE
+.vscode/
+.idea/
+# Native test artifacts
+tmp_*/
+tmp_*.txt
+tmp_*.json
+tmp_tiny_*/
+.pytest_cache/
+.native_init_marker

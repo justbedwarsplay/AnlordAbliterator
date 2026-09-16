@@ -22,8 +22,16 @@ from .config import ExportFormat, Settings
 from .evaluation import BaselineEvaluator, ComparisonResult, EvaluationResult, compare_results
 from .hardware import HardwareMetrics, HardwareMonitor, get_system_info
 from .hardware.planner import describe_pagefile_fix, plan_model_load
-from .heretic import HereticResult, HereticWrapper
-from .heretic.compatibility import estimate_vram_requirements
+from .evaluation.evaluator import AbliterationResult
+from .models.compatibility import estimate_vram_requirements, check_delta_fast_path, check_model_compatibility
+
+try:
+    from .native.abliterator import NativeAbliterator
+    from .native.config import NativeConfig, RowNormalization as NativeRowNorm
+except Exception:  # pragma: no cover
+    NativeAbliterator = None  # type: ignore
+    NativeConfig = None  # type: ignore
+    NativeRowNorm = None  # type: ignore
 from .models import prefetch_model_snapshot
 from .models.downloader import build_snapshot_plan, find_local_snapshot, list_remote_model_files
 from .reports import ReportGenerator
@@ -72,12 +80,12 @@ class AbliterationPipeline:
         self._setup_directories()
         self.monitor = HardwareMonitor(interval=1.0)
         self.baseline_result: Optional[EvaluationResult] = None
-        self.abliteration_result: Optional[HereticResult] = None
+        self.abliteration_result: Optional[AbliterationResult] = None
         self.abliterated_result: Optional[EvaluationResult] = None
         self.pipeline_result: Optional[PipelineResult] = None
         # Task 6: stable study checkpoint dir for resume (not timestamped)
-        self._study_checkpoint_dir = self.settings.get_models_dir() / "heretic_study"
-        # keep legacy fresh dir for compatibility but use stable one for Heretic
+        self._study_checkpoint_dir = self.settings.get_models_dir() / "abliteration_study"
+        # keep legacy fresh dir for compatibility but use stable one for Abliteration
         self._fresh_checkpoint_dir = self._study_checkpoint_dir
         self._delta_status: dict = {}
         logger.info("Pipeline initialized for model: %s", settings.model)
@@ -92,7 +100,7 @@ class AbliterationPipeline:
             self.settings.get_reports_dir(),
             self.settings.get_models_dir(),
             self.settings.cache_dir,
-            self.settings.get_models_dir() / "heretic_study",
+            self.settings.get_models_dir() / "abliteration_study",
         ):
             Path(directory).mkdir(parents=True, exist_ok=True)
         logger.info("Directories created in: %s", self.settings.output_dir)
@@ -115,11 +123,6 @@ class AbliterationPipeline:
         # persist delta details if available
         if hasattr(self, "_delta_status") and self._delta_status:
             config["delta_status"] = self._delta_status
-        if hasattr(self, "_calibration") and self._calibration:
-            config["calibration"] = self._calibration
-        if hasattr(self, "_eta_seconds") and self._eta_seconds:
-            config["eta_seconds"] = self._eta_seconds
-            config["per_trial_seconds"] = getattr(self, "_per_trial_seconds", None)
         self._write_json(self.settings.output_dir / "run_config.json", config)
         self._write_json(self.settings.output_dir / "environment.json", get_system_info().to_dict())
 
@@ -147,7 +150,7 @@ class AbliterationPipeline:
         self._apply_load_plan(info)
 
         if not self.settings.skip_abliteration and self.settings.quantization == "bnb_8bit":
-            logger.warning("Heretic does not support bnb_8bit; using bnb_4bit for Heretic")
+            logger.warning("Abliteration does not support bnb_8bit; using bnb_4bit for Abliteration")
 
     def _apply_load_plan(self, info) -> None:
         """Resolve auto quantization, device_map, and memory caps before loading."""
@@ -175,23 +178,23 @@ class AbliterationPipeline:
         self.settings.device_map = plan.device_map
         if not self.settings.max_memory:
             self.settings.max_memory = plan.max_memory
-        if self.settings.heretic_batch_size is None:
+        if self.settings.abliteration_batch_size is None:
             # Preserve 0 (auto) explicitly; original 'or None' lost auto case
-            self.settings.heretic_batch_size = plan.heretic_batch_size
-        if self.settings.heretic_max_batch_size is None:
-            self.settings.heretic_max_batch_size = getattr(plan, "heretic_max_batch_size", None)
+            self.settings.abliteration_batch_size = plan.abliteration_batch_size
+        if self.settings.abliteration_max_batch_size is None:
+            self.settings.abliteration_max_batch_size = getattr(plan, "abliteration_max_batch_size", None)
         # Task 1 human-readable batch log (also already in plan.reasons but explicit)
-        if plan.heretic_batch_size == 0:
+        if plan.abliteration_batch_size == 0:
             logger.info(
-                "Heretic batch size: auto (max %s) | weights %.1f GB, VRAM %.1f GB",
-                getattr(plan, "heretic_max_batch_size", 64),
+                "Abliteration batch size: auto (max %s) | weights %.1f GB, VRAM %.1f GB",
+                getattr(plan, "abliteration_max_batch_size", 64),
                 plan.estimated_weight_gb,
                 plan.available_vram_gb,
             )
         else:
             logger.info(
-                "Heretic batch size: %s | weights %.1f GB, VRAM %.1f GB",
-                plan.heretic_batch_size,
+                "Abliteration batch size: %s | weights %.1f GB, VRAM %.1f GB",
+                plan.abliteration_batch_size,
                 plan.estimated_weight_gb,
                 plan.available_vram_gb,
             )
@@ -255,54 +258,23 @@ class AbliterationPipeline:
                 return total / (1024**3)
         return None
 
-    def _new_heretic_wrapper(self, output_dir: Path, trials: int | None = None) -> HereticWrapper:
-        # Task 6: always pass study_checkpoint_dir (stable path) for resume; ETA-based timeout
-        timeout = self.settings.heretic_timeout
-        # If ETA is available, override with ETA*1.5+15min (task 6) unless user set custom timeout
-        if hasattr(self, "_eta_seconds") and self._eta_seconds:
-            eta_based = int(self._eta_seconds * 1.5 + 900)
-            if eta_based != timeout:
-                logger.info("Heretic timeout: %s s (ETA*1.5+15min, original %s s)", eta_based, timeout)
-                timeout = eta_based
-        # ensure checkpoint dir exists and is passed always
-        overrides = dict(getattr(self.settings, "heretic_config_overrides", {}) or {})
-        # merge existing config_overrides
-        base_overrides = dict(self._delta_status.get("config_overrides", {}) if hasattr(self, "_delta_status") else {}) if False else {}
-        # Use fresh checkpoint dir (stable) always
-        overrides["study_checkpoint_dir"] = str(self._study_checkpoint_dir.resolve())
-        # merge user-provided overrides if any
-        if hasattr(self, "_user_config_overrides"):
-            overrides.update(self._user_config_overrides)
-        # also respect original config_overrides if set via Settings? Settings has no hero config overrides field; use empty
-        return HereticWrapper(
-            model_id=self.settings.model,
-            output_dir=output_dir,
-            trials=trials or self.settings.heretic_trials,
-            evaluation_prompts=self.settings.heretic_evaluation_prompts,
-            dtype=self.settings.dtype,
-            device=self.settings.device,
-            device_map=self.settings.device_map,
-            quantization=self.settings.quantization,
-            seed=self.settings.seed,
-            timeout=timeout,
-            model_commit=self.settings.model_commit,
-            cache_dir=self.settings.cache_dir,
-            max_memory=self.settings.max_memory,
-            heretic_batch_size=self.settings.heretic_batch_size,
-            heretic_max_batch_size=self.settings.heretic_max_batch_size,
-            config_overrides=overrides,
-        )
 
     def _check_model_compatibility(self) -> None:
         logger.info("Checking model compatibility...")
-        wrapper = self._new_heretic_wrapper(self.settings.get_models_dir(), trials=1)
-        compatible, message = wrapper.check_compatibility()
+        # Use model compatibility checker directly (no wrapper)
+        try:
+            from transformers import AutoConfig
+            cfg = AutoConfig.from_pretrained(self.settings.model, trust_remote_code=True, cache_dir=str(self.settings.cache_dir / "hub") if self.settings.cache_dir else None)
+            arch = getattr(cfg, "architectures", [None])[0] if getattr(cfg, "architectures", None) else None
+            model_type = getattr(cfg, "model_type", None)
+        except Exception:
+            arch, model_type = None, None
+        compatible, message = check_model_compatibility(arch, model_type, self.settings.model)
         if not compatible:
             raise RuntimeError(f"Model compatibility check failed: {message}")
         logger.info("Model compatibility: %s", message)
         # Task 2: pre-flight Gated DeltaNet fast path check
         try:
-            from .heretic.compatibility import check_delta_fast_path
             self._delta_status = check_delta_fast_path(
                 self.settings.model, self.settings.model_commit, self.settings.cache_dir
             )
@@ -323,11 +295,6 @@ class AbliterationPipeline:
                 logger.debug("Model is not DeltaNet hybrid (no linear_attention layers)")
             # Task 7: weight placement will be checked inside bridge after load; log that it will be checked
             logger.info("Weight placement will be verified after model load (checking for CPU offload)")
-            # Task 8: try quick calibration via perf_probe if available (optional)
-            try:
-                self._run_perf_probe_calibration()
-            except Exception as cal_err:
-                logger.debug("Perf probe calibration skipped: %s", cal_err)
             # Persist updated run_config with delta flag (Task 2 criterion)
             try:
                 self._save_run_config()
@@ -340,111 +307,6 @@ class AbliterationPipeline:
                 self._save_run_config()
             except Exception:
                 pass
-
-    def _run_perf_probe_calibration(self) -> None:
-        """Optional Task 8: run a quick t_forward/t_decode calibration and store in run_config."""
-        # Try to use tools/perf_probe functions without full model load; simple heuristic fallback
-        # If we can import perf_probe and quickly measure, do it; otherwise store heuristic
-        try:
-            # Heuristic based on delta status: slow vs fast
-            is_delta = self._delta_status.get("is_delta_model", False)
-            fast = self._delta_status.get("fast_path_available", True)
-            if is_delta and not fast:
-                self._calibration = {"t_forward": 20.0, "t_decode": 0.1, "source": "heuristic_slow"}
-            elif is_delta and fast:
-                self._calibration = {"t_forward": 1.5, "t_decode": 0.015, "source": "heuristic_fast"}
-            else:
-                self._calibration = {"t_forward": 0.5, "t_decode": 0.02, "source": "heuristic_generic"}
-            logger.debug("Calibration: %s", self._calibration)
-        except Exception:
-            pass
-
-    def _format_duration(self, seconds: float) -> str:
-        seconds = int(seconds)
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
-        if h:
-            return f"{h} h {m:02d} min"
-        if m:
-            return f"{m} min {s:02d} s"
-        return f"{s} s"
-
-    def _estimate_heretic_eta(self) -> tuple[float, float]:
-        """Estimate total and per-trial time via formula from PERFORMANCE_DIAGNOSIS.md."""
-        n_trials = self.settings.heretic_trials
-        n_eval = self.settings.heretic_evaluation_prompts
-        # effective batch
-        batch = self.settings.heretic_batch_size
-        if batch is None or batch == 0:
-            batch = getattr(self.settings, "heretic_max_batch_size", 32) or 32
-            # auto case assume Heretic picks 32
-            if batch == 0:
-                batch = 32
-        batch = max(1, int(batch))
-        L = 100  # max_response_length default
-        # t_forward/t_decode from calibration or heuristic
-        calib = getattr(self, "_calibration", None)
-        if calib:
-            t_forward = calib.get("t_forward", 20.0)
-            t_decode = calib.get("t_decode", 0.1)
-        else:
-            is_delta = self._delta_status.get("is_delta_model", False) if hasattr(self, "_delta_status") and self._delta_status else False
-            fast = self._delta_status.get("fast_path_available", True) if hasattr(self, "_delta_status") and self._delta_status else True
-            if is_delta and not fast:
-                t_forward, t_decode = 20.0, 0.1
-            elif is_delta and fast:
-                t_forward, t_decode = 1.5, 0.015
-            else:
-                t_forward, t_decode = 0.5, 0.02
-        import math as _math
-        # Forward pass is batched, decode also batched: ceil(n_eval/batch) batches
-        batches = _math.ceil(n_eval / batch)
-        per_trial = batches * t_forward + batches * L * t_decode
-        # prefix stage ~200 prompts
-        prefix_batches = _math.ceil(200 / batch)
-        prefix = prefix_batches * L * t_decode + prefix_batches * t_forward * 0.5
-        total = prefix + per_trial * n_trials
-        return total, per_trial
-
-    def _ensure_eta_and_confirm(self) -> None:
-        """Task 3: log ETA and ask confirmation if >2h."""
-        try:
-            total, per_trial = self._estimate_heretic_eta()
-            self._eta_seconds = total
-            self._per_trial_seconds = per_trial
-            msg = f"Heretic ETA: ~{self._format_duration(total)} ({self.settings.heretic_trials} trials × ~{self._format_duration(per_trial)})"
-            logger.info(msg)
-            # Also persist ETA in run_config for later inspection
-            try:
-                self._save_run_config()
-            except Exception:
-                pass
-            # Log timeout derived
-            timeout = int(total * 1.5 + 900)
-            logger.info("Heretic timeout: %s s (ETA*1.5+15min)", timeout)
-            # Task 3: suggest fast profile if slow and long
-            is_delta = self._delta_status.get("is_delta_model", False) if hasattr(self, "_delta_status") and self._delta_status else False
-            fast = self._delta_status.get("fast_path_available", True) if hasattr(self, "_delta_status") and self._delta_status else True
-            if is_delta and not fast and total > 7200:
-                logger.warning(
-                    "Быстрый путь недоступен и ETA >2ч (%.1f ч). Рассмотрите tools/heretic_fast.toml профиль (25 триалов, 25 промптов, 64 токена) для теста.",
-                    total / 3600,
-                )
-            if total > 7200 and not getattr(self.settings, "yes", False):
-                if sys.stdin.isatty():
-                    try:
-                        resp = input(f"Estimated Heretic time {self._format_duration(total)} >2h. Continue? [y/N]: ")
-                        if resp.lower() not in ("y", "yes"):
-                            raise RuntimeError("Aborted by user due to long ETA (>2h)")
-                    except KeyboardInterrupt:
-                        raise RuntimeError("Aborted by user (Ctrl+C) during ETA confirmation")
-                else:
-                    logger.warning("ETA >2h but non-interactive; continuing (use --yes to suppress warning)")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            logger.debug("ETA estimation failed: %s", e)
 
     def _check_weight_placement(self, model) -> None:
         """Task 7: after from_pretrained, log device distribution and warn on CPU offload."""
@@ -539,7 +401,7 @@ class AbliterationPipeline:
                 and abliteration.model_id == self.settings.model
                 and not abliteration.error
                 and abliteration.abliterated_model_path
-                and HereticWrapper.is_model_directory(abliteration.abliterated_model_path)
+                and AbliterationResult.is_model_directory(abliteration.abliterated_model_path)
             ),
             "abliterated_benchmarks": abliterated_tasks,
             "comparison": (self.settings.get_results_dir() / "comparison.json").is_file(),
@@ -620,13 +482,13 @@ class AbliterationPipeline:
     def _expected_benchmarks(self) -> list[str]:
         return [] if self.settings.skip_benchmarks else self.settings.benchmarks
 
-    def _baseline_heretic_matches(self, result: EvaluationResult) -> bool:
-        """Reuse Heretic metrics for the same model even if benchmark limit/mode changed."""
+    def _baseline_abliteration_matches(self, result: EvaluationResult) -> bool:
+        """Reuse Abliteration metrics for the same model even if benchmark limit/mode changed."""
         return result.model_id == self.settings.model
 
-    def _load_standalone_heretic_metrics(self) -> HereticResult | None:
+    def _load_standalone_abliteration_metrics(self) -> AbliterationResult | None:
         path = (
-            self.settings.get_models_dir() / "heretic_baseline" / "heretic_evaluation.json"
+            self.settings.get_models_dir() / "abliteration_baseline" / "abliteration_evaluation.json"
         )
         if not path.is_file():
             return None
@@ -645,8 +507,8 @@ class AbliterationPipeline:
         total_prompts = int(data.get("total_prompts") or 0)
         initial_refusals = int(data.get("initial_refusals") or 0)
         final_refusals = int(data.get("final_refusals") or initial_refusals)
-        logger.info("Loaded Heretic metrics from %s", path)
-        return HereticResult(
+        logger.info("Loaded Abliteration metrics from %s", path)
+        return AbliterationResult(
             model_id=model_id,
             initial_refusals=initial_refusals,
             final_refusals=final_refusals,
@@ -657,21 +519,21 @@ class AbliterationPipeline:
             evaluation_time_seconds=float(data.get("evaluation_time") or 0.0),
         )
 
-    def _heretic_result_to_reuse(self, existing: EvaluationResult | None) -> HereticResult | None:
+    def _abliteration_result_to_reuse(self, existing: EvaluationResult | None) -> AbliterationResult | None:
         evaluation_path = self.settings.get_results_dir() / "baseline" / "evaluation.json"
         if existing is None:
             logger.info("No baseline evaluation.json at %s", evaluation_path)
-        elif not existing.heretic_succeeded():
-            logger.info("Baseline evaluation.json has no successful Heretic metrics")
-        elif not self._baseline_heretic_matches(existing):
+        elif not existing.abliteration_succeeded():
+            logger.info("Baseline evaluation.json has no successful Abliteration metrics")
+        elif not self._baseline_abliteration_matches(existing):
             logger.info(
-                "Heretic baseline is for %s, current model is %s",
+                "Abliteration baseline is for %s, current model is %s",
                 existing.model_id,
                 self.settings.model,
             )
         else:
-            return existing.heretic
-        fallback = self._load_standalone_heretic_metrics()
+            return existing.abliteration
+        fallback = self._load_standalone_abliteration_metrics()
         if fallback is not None:
             return fallback
         return None
@@ -679,7 +541,7 @@ class AbliterationPipeline:
     def _baseline_matches_current_run(self, result: EvaluationResult) -> bool:
         config = result.config
         return (
-            self._baseline_heretic_matches(result)
+            self._baseline_abliteration_matches(result)
             and config.get("benchmarks") == self._expected_benchmarks()
             and config.get("num_fewshot") == self.settings.num_fewshot
             and config.get("limit") == self.settings.limit
@@ -702,31 +564,31 @@ class AbliterationPipeline:
             if self.settings.skip_benchmarks:
                 self.baseline_result.benchmarks = {}
             logger.info("Baseline evaluation completed")
-            logger.info("Releasing GPU/RAM after baseline so Heretic can map the model")
+            logger.info("Releasing GPU/RAM after baseline so Abliteration can map the model")
             free_torch_memory()
             return
         if self.settings.skip_baseline:
             raise RuntimeError(
                 "--skip-baseline was specified, but no complete baseline evaluation exists"
             )
-        # Task 4: avoid duplicate Heretic evaluation — reuse abliteration initial metrics by default
-        should_skip_heretic = (
+        # Task 4: avoid duplicate Abliteration evaluation — reuse abliteration initial metrics by default
+        should_skip_abliteration = (
             not getattr(self.settings, "baseline_evaluate", False)
             and not self.settings.skip_abliteration
         )
-        if should_skip_heretic:
+        if should_skip_abliteration:
             logger.info(
-                "Skipping separate baseline Heretic evaluation; will reuse abliteration initial metrics (use --baseline-evaluate to force separate run)"
+                "Skipping separate baseline Abliteration evaluation; will reuse abliteration initial metrics (use --baseline-evaluate to force separate run)"
             )
-            # Still need baseline benchmarks unless skipped; run them now without Heretic
+            # Still need baseline benchmarks unless skipped; run them now without Abliteration
             # Try to reuse existing benchmarks if resume
             if self.settings.skip_benchmarks:
-                # No benchmarks needed, create empty baseline (heretic will be filled after abliteration)
+                # No benchmarks needed, create empty baseline (abliteration will be filled after abliteration)
                 from datetime import datetime as _dt
                 self.baseline_result = EvaluationResult(
                     model_id=self.settings.model,
                     evaluation_type="baseline",
-                    heretic=None,
+                    abliteration=None,
                     benchmarks={},
                     timestamp=_dt.now().isoformat(),
                     config={
@@ -744,21 +606,21 @@ class AbliterationPipeline:
                         "cache_dir": str(self.settings.cache_dir) if self.settings.cache_dir else None,
                     },
                 )
-                # Save placeholder so resume can find it (will be overwritten later with heretic)
+                # Save placeholder so resume can find it (will be overwritten later with abliteration)
                 self._write_json(
                     self.settings.get_baseline_results_dir() / "evaluation.json",
                     self.baseline_result.to_dict(),
                 )
-                logger.info("Baseline benchmarks skipped; Heretic metrics deferred")
+                logger.info("Baseline benchmarks skipped; Abliteration metrics deferred")
                 free_torch_memory()
                 return
-            # Run benchmarks only (no Heretic)
+            # Run benchmarks only (no Abliteration)
             from datetime import datetime as _dt
             # Create result object
             result = EvaluationResult(
                 model_id=self.settings.model,
                 evaluation_type="baseline",
-                heretic=None,
+                abliteration=None,
                 timestamp=_dt.now().isoformat(),
                 config={
                     "benchmarks": expected,
@@ -776,7 +638,7 @@ class AbliterationPipeline:
                 },
             )
             if expected:
-                logger.info("Running baseline benchmarks only (Heretic deferred to abliteration)")
+                logger.info("Running baseline benchmarks only (Abliteration deferred to abliteration)")
                 runner = self._get_benchmark_runner(
                     self.settings.model, self.settings.get_baseline_results_dir()
                 )
@@ -808,25 +670,25 @@ class AbliterationPipeline:
                     result.to_dict(),
                 )
             self.baseline_result = result
-            # Heretic is None for now; will be filled after abliteration in _run_or_load_abliteration
-            logger.info("Baseline benchmarks completed (Heretic deferred)")
+            # Abliteration is None for now; will be filled after abliteration in _run_or_load_abliteration
+            logger.info("Baseline benchmarks completed (Abliteration deferred)")
             free_torch_memory()
             return
-        # Normal path: run full baseline evaluation with Heretic
-        reuse_heretic = None
+        # Normal path: run full baseline evaluation with Abliteration
+        reuse_abliteration = None
         if self.settings.resume:
-            reuse_heretic = self._heretic_result_to_reuse(existing)
-        if reuse_heretic is not None:
+            reuse_abliteration = self._abliteration_result_to_reuse(existing)
+        if reuse_abliteration is not None:
             logger.info(
-                "Reusing completed Heretic baseline; retrying failed/missing benchmarks only"
+                "Reusing completed Abliteration baseline; retrying failed/missing benchmarks only"
             )
         evaluator = BaselineEvaluator(
             model_id=self.settings.model,
             output_dir=self.settings.get_results_dir(),
-            heretic_output_dir=self.settings.get_models_dir() / "heretic_baseline",
-            trials=self.settings.heretic_trials,
-            evaluation_prompts=self.settings.heretic_evaluation_prompts,
-            timeout=self.settings.heretic_timeout,
+            abliteration_output_dir=self.settings.get_models_dir() / "abliteration_baseline",
+            trials=self.settings.abliteration_trials,
+            evaluation_prompts=self.settings.abliteration_evaluation_prompts,
+            timeout=self.settings.abliteration_timeout,
             dtype=self.settings.dtype,
             device=self.settings.device,
             device_map=self.settings.device_map,
@@ -836,15 +698,15 @@ class AbliterationPipeline:
             model_commit=self.settings.model_commit,
             cache_dir=self.settings.cache_dir,
             max_memory=self.settings.max_memory,
-            heretic_batch_size=self.settings.heretic_batch_size,
-            heretic_max_batch_size=self.settings.heretic_max_batch_size,
+            abliteration_batch_size=self.settings.abliteration_batch_size,
+            abliteration_max_batch_size=self.settings.abliteration_max_batch_size,
             native_benchmarks=getattr(self.settings, "native_benchmarks", True),
         )
         self.baseline_result = evaluator.run_evaluation(
             benchmarks=expected,
             num_fewshot=self.settings.num_fewshot,
             limit=self.settings.limit,
-            reuse_heretic=reuse_heretic,
+            reuse_abliteration=reuse_abliteration,
         )
 
         if not self.baseline_result or not self.baseline_result.successful_for(expected):
@@ -853,17 +715,17 @@ class AbliterationPipeline:
         if self.settings.skip_benchmarks:
             self.baseline_result.benchmarks = {}
         logger.info("Baseline evaluation completed")
-        logger.info("Releasing GPU/RAM after baseline so Heretic can map the model")
+        logger.info("Releasing GPU/RAM after baseline so Abliteration can map the model")
         free_torch_memory()
 
     def _synthesize_baseline_from_abliteration(self) -> None:
-        """Task 4: fill deferred baseline Heretic metrics from abliteration initial values."""
-        if self.baseline_result is None or self.baseline_result.heretic is not None:
+        """Task 4: fill deferred baseline Abliteration metrics from abliteration initial values."""
+        if self.baseline_result is None or self.baseline_result.abliteration is not None:
             return
         if not self.abliteration_result or self.abliteration_result.error:
             return
-        # Create HereticResult for baseline: initial == final == abliteration initial
-        from .heretic.wrapper import HereticResult as _HR
+        # Create AbliterationResult for baseline: initial == final == abliteration initial
+        from .evaluation.evaluator import AbliterationResult as _HR
         ar = self.abliteration_result
         hr = _HR(
             model_id=self.settings.model,
@@ -878,22 +740,23 @@ class AbliterationPipeline:
             evaluation_time_seconds=ar.evaluation_time_seconds,
             config=ar.config,
         )
-        self.baseline_result.heretic = hr
+        self.baseline_result.abliteration = hr
         # Persist updated baseline
         self._write_json(
             self.settings.get_baseline_results_dir() / "evaluation.json",
             self.baseline_result.to_dict(),
         )
         logger.info(
-            "Synthesized baseline Heretic metrics from abliteration: refusals %s/%s, KL %.4f",
+            "Synthesized baseline Abliteration metrics from abliteration: refusals %s/%s, KL %.4f",
             hr.initial_refusals,
             hr.total_prompts,
             hr.kl_divergence,
         )
 
     def _run_or_load_abliteration(self) -> None:
+        backend = getattr(self.settings, "abliteration_backend", "native")
         logger.info("\n%s", "=" * 60)
-        logger.info("STEP 2: Heretic Abliteration")
+        logger.info("STEP 2: Abliteration (backend=%s)", backend)
         logger.info("%s", "=" * 60)
         existing = self._load_abliteration_result()
         existing_valid = bool(
@@ -901,7 +764,7 @@ class AbliterationPipeline:
             and existing.model_id == self.settings.model
             and not existing.error
             and existing.abliterated_model_path
-            and HereticWrapper.is_model_directory(existing.abliterated_model_path)
+            and AbliterationResult.is_model_directory(existing.abliterated_model_path)
         )
         if (self.settings.resume or self.settings.skip_abliteration) and existing_valid:
             logger.info("Using completed abliteration")
@@ -913,41 +776,79 @@ class AbliterationPipeline:
                 "--skip-abliteration was specified, but no valid abliterated model exists"
             )
 
-        # Task 3: ETA and confirmation before long run
-        self._ensure_eta_and_confirm()
-        logger.info("Freeing leftover CUDA tensors before the Heretic child process")
+        logger.info("Freeing leftover CUDA tensors before abliteration")
         free_torch_memory()
         # Ensure study checkpoint dir exists
         try:
             self._study_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        wrapper = self._new_heretic_wrapper(self.settings.get_models_dir())
-        logger.info("Heretic n_startup_trials: %s (auto ~1/3 of %s)", wrapper.n_startup_trials, wrapper.trials)
-        result = wrapper.run_abliteration(save_model=True, merge_lora=True)
-        if result.error:
-            raise RuntimeError(f"Abliteration failed: {result.error}")
-        if not result.abliterated_model_path or not HereticWrapper.is_model_directory(
-            result.abliterated_model_path
-        ):
-            raise RuntimeError("Abliteration did not produce a valid model")
-        self.abliteration_result = result
-        self._write_json(self.settings.get_results_dir() / "abliteration.json", result.to_dict())
-        logger.info(
-            "Abliteration completed: refusals %s -> %s; KL divergence %.4f",
-            result.initial_refusals,
-            result.final_refusals,
-            result.kl_divergence,
-        )
-        self._synthesize_baseline_from_abliteration()
 
-    def _load_abliteration_result(self) -> HereticResult | None:
+        # Native backend — 1:1 replication, in-process, no abliteration-llm dependency
+        use_native = backend in ("native", "auto") and NativeAbliterator is not None
+        # fallback to abliteration if native unavailable or explicitly requested
+        if use_native:
+            try:
+                logger.info("Using native abliterator (no abliteration subprocess)")
+                native_cfg = NativeConfig.from_anlord_settings(self.settings)  # type: ignore
+                # propagate row_norm / orthogonalize / winsorization overrides from Settings
+                try:
+                    # map string to enum
+                    if getattr(self.settings, "row_normalization", None):
+                        native_cfg.row_normalization = NativeRowNorm(getattr(self.settings, "row_normalization"))  # type: ignore
+                    native_cfg.orthogonalize_direction = bool(getattr(self.settings, "orthogonalize_direction", True))
+                    native_cfg.winsorization_quantile = float(getattr(self.settings, "winsorization_quantile", 1.0))
+                    native_cfg.kl_divergence_scale = float(getattr(self.settings, "kl_divergence_scale", 1.0))
+                    native_cfg.kl_divergence_target = float(getattr(self.settings, "kl_divergence_target", 0.01))
+                    native_cfg.full_normalization_lora_rank = int(getattr(self.settings, "full_normalization_lora_rank", 3))
+                except Exception as e:
+                    logger.debug("Native config override failed: %s", e)
+                abliter = NativeAbliterator(native_cfg)  # type: ignore
+                # output dir: models/abliteration_output equivalent but native
+                native_out = self.settings.get_models_dir() / "abliterated"
+                native_out.mkdir(parents=True, exist_ok=True)
+                native_result = abliter.run(output_dir=native_out, timeout=self.settings.abliteration_timeout)
+                # convert to AbliterationResult for pipeline compatibility
+                result = AbliterationResult(
+                    model_id=native_result.model_id,
+                    abliterated_model_path=native_result.abliterated_model_path,
+                    initial_refusals=native_result.initial_refusals,
+                    final_refusals=native_result.final_refusals,
+                    total_prompts=native_result.total_prompts,
+                    initial_refusal_rate=(native_result.initial_refusals / native_result.total_prompts if native_result.total_prompts else 0),
+                    final_refusal_rate=(native_result.final_refusals / native_result.total_prompts if native_result.total_prompts else 0),
+                    kl_divergence=native_result.kl_divergence,
+                    trials=native_result.trials,
+                    best_trial=native_result.best_trial,
+                    config=native_result.config,
+                )
+
+                self.abliteration_result = result
+                self._write_json(self.settings.get_results_dir() / "abliteration.json", result.to_dict())
+                logger.info(
+                    "Native abliteration completed: refusals %s -> %s; KL divergence %.4f",
+                    result.initial_refusals,
+                    result.final_refusals,
+                    result.kl_divergence,
+                )
+                self._synthesize_baseline_from_abliteration()
+                return
+            except Exception as native_err:
+                logger.error("Native abliteration failed: %s", native_err, exc_info=True)
+                if backend == "native":
+                    raise RuntimeError(f"Native abliteration failed: {native_err}") from native_err
+                logger.warning("Falling back to Abliteration backend (native failed)")
+                raise RuntimeError(f"Native abliteration failed and no fallback available: {native_err}") from native_err
+
+        raise RuntimeError("Native abliteration is unavailable and no fallback is configured")
+
+    def _load_abliteration_result(self) -> AbliterationResult | None:
         path = self.settings.get_results_dir() / "abliteration.json"
         if not path.is_file():
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return HereticResult(
+            return AbliterationResult(
                 model_id=data["model"],
                 abliterated_model_path=data.get("abliterated_model"),
                 initial_refusals=data.get("initial_refusals", 0),
@@ -976,13 +877,13 @@ class AbliterationPipeline:
         if not self.abliteration_result or not self.abliteration_result.abliterated_model_path:
             raise RuntimeError("No abliterated model is available for evaluation")
         model_path = self.abliteration_result.abliterated_model_path
-        if not HereticWrapper.is_model_directory(model_path):
+        if not AbliterationResult.is_model_directory(model_path):
             raise RuntimeError(f"Abliterated model directory is invalid: {model_path}")
 
         result = EvaluationResult(
             model_id=model_path,
             evaluation_type="abliterated",
-            heretic=self.abliteration_result,
+            abliteration=self.abliteration_result,
             timestamp=datetime.now().isoformat(),
         )
         if not self.settings.skip_benchmarks:

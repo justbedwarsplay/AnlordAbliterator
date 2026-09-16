@@ -87,7 +87,7 @@ class ModelRegistry:
             parameter_count=12_000_000_000,
             recommended_dtype="auto",
             recommended_quantization="none",
-            notes="Well-supported by Heretic",
+            notes="Well-supported by Abliteration",
         ),
         # Mistral models
         "mistralai/Mistral-Nemo-Instruct-2407": ModelInfo(

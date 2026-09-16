@@ -11,9 +11,6 @@ accelerate>=1.0.0
 # Transformers & Tokenizers
 transformers[kernels]>=4.46.0
 
-# Heretic - Abliteration Library
-heretic-llm>=1.4.0,<2.0
-
 # LM Evaluation Harness - Benchmarking
 lm-eval[hf]>=0.4.9,<0.5
 

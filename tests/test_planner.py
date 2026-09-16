@@ -4,8 +4,8 @@
 from anlord.hardware.planner import (
     estimate_weight_gb_from_name,
     explain_model_load_failure,
-    heretic_device_map_for,
-    heretic_dtypes_for,
+    abliteration_device_map_for,
+    abliteration_dtypes_for,
     looks_like_access_violation,
     plan_model_load,
 )
@@ -34,8 +34,8 @@ def test_auto_quantization_enables_4bit_for_20b_on_8gb_laptop():
     assert plan.max_memory is not None
     assert "0" in plan.max_memory
     assert "cpu" in plan.max_memory
-    assert plan.heretic_batch_size == 1
-    assert plan.heretic_dtypes == ["auto", "bfloat16", "float16"]
+    assert plan.abliteration_batch_size == 1
+    assert plan.abliteration_dtypes == ["auto", "bfloat16", "float16"]
 
 
 def test_windows_auto_avoids_mixed_4bit_offload_for_20b():
@@ -115,12 +115,12 @@ def test_small_model_stays_full_precision():
 
 
 def test_cuda_device_uses_accelerate_auto_map():
-    assert heretic_device_map_for("cuda") == "auto"
-    assert heretic_device_map_for("cpu") == "cpu"
+    assert abliteration_device_map_for("cuda") == "auto"
+    assert abliteration_device_map_for("cpu") == "cpu"
 
 
 def test_auto_dtype_does_not_collapse_to_a_single_attempt():
-    assert heretic_dtypes_for("auto") == ["auto", "bfloat16", "float16"]
+    assert abliteration_dtypes_for("auto") == ["auto", "bfloat16", "float16"]
 
 
 def test_pagefile_error_is_explained_without_rich_traceback():

@@ -37,7 +37,7 @@ class SystemInfo:
     # Library Versions
     pytorch_version: str = ""
     transformers_version: str = ""
-    heretic_version: str = ""
+    abliteration_version: str = ""
     lm_eval_version: str = ""
 
     # Python Information
@@ -57,7 +57,7 @@ class SystemInfo:
             "os_name": self.os_name,
             "pytorch_version": self.pytorch_version,
             "transformers_version": self.transformers_version,
-            "heretic_version": self.heretic_version,
+            "abliteration_version": self.abliteration_version,
             "lm_eval_version": self.lm_eval_version,
             "python_version": self.python_version,
         }
@@ -156,7 +156,7 @@ class HardwareMonitor:
     def _get_vram_info(self) -> tuple[float, float]:
         """Get device-wide VRAM usage in GB.
 
-        Heretic runs in a child process, so ``torch.cuda.memory_reserved()`` in
+        Abliteration runs in a child process, so ``torch.cuda.memory_reserved()`` in
         the Anlord Abliterator process cannot see its allocations.  NVML reports usage for
         the whole device and therefore gives the correct pipeline peak.
         """
@@ -346,7 +346,7 @@ def get_system_info() -> SystemInfo:
     if nvml_gpu is not None:
         info.has_cuda, info.gpu_name, info.gpu_count, info.total_vram_gb = nvml_gpu
     else:
-        # Last resort: this initializes a CUDA context and steals VRAM from Heretic.
+        # Last resort: this initializes a CUDA context and steals VRAM from Abliteration.
         info.has_cuda = torch.cuda.is_available()
         if info.has_cuda:
             info.gpu_count = torch.cuda.device_count()
@@ -373,11 +373,11 @@ def get_system_info() -> SystemInfo:
         info.transformers_version = "not installed"
 
     try:
-        import heretic
+        from anlord import __version__ as _ver
 
-        info.heretic_version = getattr(heretic, "__version__", "unknown")
-    except ImportError:
-        info.heretic_version = "not installed"
+        info.abliteration_version = _ver
+    except Exception:
+        info.abliteration_version = "native"
 
     try:
         import lm_eval
@@ -429,7 +429,7 @@ def print_system_info(info: SystemInfo):
     print(f"  Python:    {info.python_version}")
     print(f"  PyTorch:   {info.pytorch_version}")
     print(f"  Transformers: {info.transformers_version}")
-    print(f"  Heretic:   {info.heretic_version}")
+    print(f"  Abliteration:   {info.abliteration_version}")
     print(f"  lm-eval:   {info.lm_eval_version}")
 
     print("\n" + "=" * 50 + "\n")

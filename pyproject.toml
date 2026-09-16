@@ -1,6 +1,6 @@
 [project]
 name = "anlord"
-version = "1.0.0"
+version = "1.1.0"
 description = "Anlord Abliterator — automated LLM abliteration and evaluation"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
@@ -27,7 +27,6 @@ dependencies = [
     "torchvision>=0.17.0",
     "accelerate>=1.0.0",
     "transformers[kernels]>=4.46.0",
-    "heretic-llm>=1.4.0,<2.0",
     "huggingface-hub>=0.24.0",
     "bitsandbytes>=0.44.0",
     "peft>=0.13.0",

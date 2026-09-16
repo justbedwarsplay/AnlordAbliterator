@@ -116,11 +116,11 @@ def _disable_transformers_optional(
 
 
 def free_torch_memory() -> None:
-    """Drop unused CUDA/RAM so a Heretic child can map the model on Windows.
+    """Drop unused CUDA/RAM so a Abliteration child can map the model on Windows.
 
     Must not call ``torch.cuda.is_available()`` unless CUDA is already
     initialized. That call creates a parent-process CUDA context (~0.5-1 GB)
-    which then steals VRAM from the Heretic child and 4-bit 9B loads crash.
+    which then steals VRAM from the Abliteration child and 4-bit 9B loads crash.
     """
     import gc
 

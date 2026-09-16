@@ -86,19 +86,39 @@ Examples:
         help="Prompt for an optional in-memory HF token at startup",
     )
 
-    # Heretic configuration
-    heretic_group = parser.add_argument_group("Heretic Configuration")
-    heretic_group.add_argument(
-        "--trials", "-t", type=int, default=None, help="Number of Heretic optimization trials"
+    # Abliteration / Native configuration
+    abliteration_group = parser.add_argument_group("Abliteration Configuration")
+    abliteration_group.add_argument(
+        "--trials", "-t", type=int, default=None, help="Number of optimization trials"
     )
-    heretic_group.add_argument(
+    abliteration_group.add_argument(
         "--timeout",
         type=int,
         default=43200,
-        help="Timeout for Heretic in seconds (default: 12 hours)",
+        help="Timeout for abliteration in seconds (default: 12 hours)",
     )
-    heretic_group.add_argument(
+    abliteration_group.add_argument(
         "--eval-prompts", type=int, default=100, help="Number of evaluation prompts"
+    )
+    abliteration_group.add_argument(
+        "--backend",
+        type=str,
+        choices=["native", "auto"],
+        default="native",
+        help="Abliteration backend: native (default), auto (alias for native)",
+    )
+    abliteration_group.add_argument(
+        "--row-normalization",
+        type=str,
+        choices=["none", "pre", "full"],
+        default="full",
+        help="Row normalization mode (parity with Abliteration)",
+    )
+    abliteration_group.add_argument(
+        "--no-orthogonalize",
+        action="store_true",
+        default=False,
+        help="Disable orthogonalized direction (projected abliteration)",
     )
 
     # Benchmark configuration
@@ -171,13 +191,13 @@ Examples:
         "--baseline-evaluate",
         action="store_true",
         default=False,
-        help="Force separate Heretic baseline evaluation (default: reuse abliteration initial metrics)",
+        help="Force separate Abliteration baseline evaluation (default: reuse abliteration initial metrics)",
     )
     pipeline_group.add_argument(
         "--yes",
         action="store_true",
         default=False,
-        help="Auto-confirm long ETA prompts (>2h) without interactive question",
+        help="Auto-confirm interactive prompts without question (kept for compat, no preliminary ETA anymore)",
     )
 
     # Reproducibility
@@ -245,9 +265,12 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         output_dir=Path(args.output) if args.output else Path("./output"),
         cache_dir=Path(args.cache_dir) if args.cache_dir else Path("./cache"),
         prefetch_model=args.prefetch_model,
-        heretic_trials=args.trials if args.trials is not None else 100,
-        heretic_timeout=args.timeout,
-        heretic_evaluation_prompts=args.eval_prompts,
+        abliteration_trials=args.trials if args.trials is not None else 100,
+        abliteration_timeout=args.timeout,
+        abliteration_evaluation_prompts=args.eval_prompts,
+        abliteration_backend=getattr(args, "backend", "native"),
+        row_normalization=getattr(args, "row_normalization", "full"),
+        orthogonalize_direction=not getattr(args, "no_orthogonalize", False),
         benchmarks=benchmarks,
         mode=selected_mode,
         limit=limit,

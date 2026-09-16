@@ -289,7 +289,7 @@ def reject_unsupported_weight_layout(
     remote_files: Iterable[RemoteFile | str],
     plan: SnapshotPlan,
 ) -> None:
-    """Fail early when the repo cannot be loaded by Heretic/Transformers."""
+    """Fail early when the repo cannot be loaded by Abliteration/Transformers."""
     names = [
         item.name if isinstance(item, RemoteFile) else item for item in remote_files
     ]
@@ -300,7 +300,7 @@ def reject_unsupported_weight_layout(
         if suggested == model_id:
             suggested = "the matching non-GGUF Hugging Face repo"
         raise RuntimeError(
-            f"{model_id} is a GGUF repository. Heretic and Anlord Abliterator need "
+            f"{model_id} is a GGUF repository. Abliteration and Anlord Abliterator need "
             "Transformers weights (.safetensors), not a llama.cpp quant. "
             f"Abliterate {suggested} instead, then convert the exported model to "
             "Q4_K_M with llama.cpp if you want that GGUF file. "

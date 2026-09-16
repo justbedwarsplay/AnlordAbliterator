@@ -88,14 +88,14 @@ def compare_results(
     )
 
     # Extract refusal metrics
-    if baseline.heretic:
-        comparison.initial_refusals_baseline = baseline.heretic.initial_refusals
-        comparison.final_refusals_baseline = baseline.heretic.final_refusals
+    if baseline.abliteration:
+        comparison.initial_refusals_baseline = baseline.abliteration.initial_refusals
+        comparison.final_refusals_baseline = baseline.abliteration.final_refusals
 
-    if abliterated.heretic:
-        comparison.initial_refusals_abliterated = abliterated.heretic.initial_refusals
-        comparison.final_refusals_abliterated = abliterated.heretic.final_refusals
-        comparison.kl_divergence = abliterated.heretic.kl_divergence
+    if abliterated.abliteration:
+        comparison.initial_refusals_abliterated = abliterated.abliteration.initial_refusals
+        comparison.final_refusals_abliterated = abliterated.abliteration.final_refusals
+        comparison.kl_divergence = abliterated.abliteration.kl_divergence
 
     # Compare benchmarks
     common_tasks = set(baseline.benchmarks.keys()) & set(abliterated.benchmarks.keys())

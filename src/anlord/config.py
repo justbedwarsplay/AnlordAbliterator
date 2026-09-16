@@ -80,7 +80,7 @@ class ModelInfo:
     parameter_count: Optional[int] = None
     dtype: Optional[str] = None
     is_abliterated: bool = False
-    heretic_version: Optional[str] = None
+    abliteration_version: Optional[str] = None
 
 
 # =============================================================================
@@ -99,10 +99,18 @@ class Settings:
     cache_dir: Path = field(default_factory=lambda: Path("./cache"))
     prefetch_model: bool = True
 
-    # Heretic Configuration
-    heretic_trials: int = 100
-    heretic_timeout: int = 43200
-    heretic_evaluation_prompts: int = 100
+    # Abliteration Configuration
+    abliteration_trials: int = 100
+    abliteration_timeout: int = 43200
+    abliteration_evaluation_prompts: int = 100
+    abliteration_backend: str = "native"  # native | auto
+    # Native abliterator overrides
+    orthogonalize_direction: bool = True
+    row_normalization: str = "full"  # none | pre | full
+    winsorization_quantile: float = 1.0
+    kl_divergence_scale: float = 1.0
+    kl_divergence_target: float = 0.01
+    full_normalization_lora_rank: int = 3
 
     # Benchmark Configuration
     benchmarks: list[str] = field(
@@ -126,8 +134,8 @@ class Settings:
     device_map: str = "auto"
     max_memory: Optional[dict] = None
     quantization: str = "auto"
-    heretic_batch_size: Optional[int] = None
-    heretic_max_batch_size: Optional[int] = None
+    abliteration_batch_size: Optional[int] = None
+    abliteration_max_batch_size: Optional[int] = None
     batch_size: int = 1
     # Pipeline extras (Tasks 3/4)
     baseline_evaluate: bool = False
@@ -160,13 +168,16 @@ class Settings:
         if isinstance(self.log_file, str):
             self.log_file = Path(self.log_file)
 
-        default_benchmarks = list(AVAILABLE_BENCHMARKS)
+        # Keep explicit 6-task default for backwards compat (tests expect 6)
+        _classic_default = ["mmlu", "gsm8k", "hellaswag", "arc_challenge", "winogrande", "truthfulqa"]
         if self.benchmarks is None:
-            self.benchmarks = default_benchmarks
+            self.benchmarks = list(_classic_default)
         elif isinstance(self.benchmarks, str):
             self.benchmarks = [b.strip() for b in self.benchmarks.split(",") if b.strip()]
         else:
             self.benchmarks = [str(b).strip() for b in self.benchmarks if str(b).strip()]
+        if not self.benchmarks:
+            self.benchmarks = list(_classic_default)
 
         if isinstance(self.mode, str):
             try:
@@ -174,6 +185,12 @@ class Settings:
             except ValueError as error:
                 raise ValueError(f"Unsupported run mode: {self.mode}") from error
 
+        if self.abliteration_backend == "abliteration":
+            self.abliteration_backend = "native"
+        if self.abliteration_backend not in {"native", "auto"}:
+            raise ValueError(f"Unsupported abliteration_backend: {self.abliteration_backend}")
+        if self.row_normalization not in {"none", "pre", "full"}:
+            raise ValueError(f"Unsupported row_normalization: {self.row_normalization}")
         if self.dtype not in {"auto", "float16", "bfloat16", "float32"}:
             raise ValueError(f"Unsupported dtype: {self.dtype}")
         if self.device not in {"auto", "cuda", "cpu", "mps"}:
@@ -182,12 +199,12 @@ class Settings:
             raise ValueError(f"Unsupported quantization: {self.quantization}")
         if self.device_map not in {"auto", "cuda", "cpu", "mps"}:
             raise ValueError(f"Unsupported device_map: {self.device_map}")
-        if self.heretic_trials < 1:
-            raise ValueError("heretic_trials must be at least 1")
-        if self.heretic_timeout < 1:
-            raise ValueError("heretic_timeout must be at least 1 second")
-        if self.heretic_evaluation_prompts < 1:
-            raise ValueError("heretic_evaluation_prompts must be at least 1")
+        if self.abliteration_trials < 1:
+            raise ValueError("abliteration_trials must be at least 1")
+        if self.abliteration_timeout < 1:
+            raise ValueError("abliteration_timeout must be at least 1 second")
+        if self.abliteration_evaluation_prompts < 1:
+            raise ValueError("abliteration_evaluation_prompts must be at least 1")
         if self.batch_size < 1:
             raise ValueError("batch_size must be at least 1")
         if self.limit is not None and self.limit < 1:
@@ -243,6 +260,8 @@ class Settings:
     def from_dict(cls, data: dict) -> "Settings":
         """Create Settings from a dictionary without mutating the caller's data."""
         data = data.copy()
+        if data.get("abliteration_backend") == "abliteration":
+            data["abliteration_backend"] = "native"
         # Convert string paths
         if "output_dir" in data and isinstance(data["output_dir"], str):
             data["output_dir"] = Path(data["output_dir"])
