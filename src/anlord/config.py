@@ -111,6 +111,48 @@ class Settings:
     kl_divergence_scale: float = 1.0
     kl_divergence_target: float = 0.01
     full_normalization_lora_rank: int = 3
+    abliteration_subspace_rank: int = 1  # 1=single vector, 3-5=subspace
+    abliteration_subspace_method: str = "svd"
+    # Include list of model components to ablate (e.g. ["attn.o_proj"] or the
+    # prefix ["attn"] to ablate only attention and leave MLP untouched).
+    # None = all abliterable components of the model.
+    abliteration_components: Optional[list] = None
+    capability_proxy: bool = False
+    capability_proxy_enabled: bool = False
+    capability_proxy_dataset: str = "cais/mmlu"
+    capability_proxy_subset: str = "abstract_algebra"
+    capability_proxy_samples: int = 20
+    capability_proxy_fewshot: int = 5
+
+    # Residual analysis (requires the optional research dependencies)
+    print_residual_geometry: bool = False
+    plot_residuals: bool = False
+    residual_plot_path: str = "plots"
+    residual_plot_title: str = 'PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts'
+    residual_plot_style: str = "dark_background"
+    print_debug_information: bool = False
+
+    # Scorer plugins (extensible objectives for the native pipeline).
+    # None = default set (refusals keyword-rate + KL divergence, both minimized).
+    # Each entry: {"plugin": "<builtin|module.Class|path.py:Class>",
+    #              "optimization": "minimize"|"maximize"|"none",
+    #              "instance_name": optional}
+    scorers: Optional[list] = None
+    # Raw settings tables for scorer instances, keyed by "<ClassName>" or
+    # "<ClassName>_<instance_name>" (only keys known to the scorer are applied).
+    scorer_settings: Optional[dict] = None
+
+    # Export / reproduction
+    export_strategy: str = "merge"  # merge | adapter
+    max_shard_size: str = "5GB"
+    # Which reproduction information to generate at export:
+    # "full" (+system info), "basic" (settings + packages), "none".
+    reproducibility_information: str = "full"
+    # Reproduction mode: path or URL of a reproduce.json file to re-apply.
+    reproduce: Optional[str] = None
+    # Whether to attempt reproduction even if there are environment mismatches
+    # (None = proceed with a warning, False = abort, True = proceed silently).
+    ignore_mismatches: Optional[bool] = None
 
     # Benchmark Configuration
     benchmarks: list[str] = field(
@@ -189,6 +231,18 @@ class Settings:
             self.abliteration_backend = "native"
         if self.abliteration_backend not in {"native", "auto"}:
             raise ValueError(f"Unsupported abliteration_backend: {self.abliteration_backend}")
+        if self.abliteration_components is not None:
+            if isinstance(self.abliteration_components, str):
+                self.abliteration_components = [
+                    name.strip() for name in self.abliteration_components.split(",") if name.strip()
+                ]
+            self.abliteration_components = [
+                str(name).strip() for name in self.abliteration_components if str(name).strip()
+            ]
+            if not self.abliteration_components:
+                raise ValueError(
+                    "abliteration_components cannot be empty; omit it to ablate all components"
+                )
         if self.row_normalization not in {"none", "pre", "full"}:
             raise ValueError(f"Unsupported row_normalization: {self.row_normalization}")
         if self.dtype not in {"auto", "float16", "bfloat16", "float32"}:
@@ -199,6 +253,35 @@ class Settings:
             raise ValueError(f"Unsupported quantization: {self.quantization}")
         if self.device_map not in {"auto", "cuda", "cpu", "mps"}:
             raise ValueError(f"Unsupported device_map: {self.device_map}")
+        self.export_strategy = str(self.export_strategy).lower()
+        if self.export_strategy not in {"merge", "adapter"}:
+            raise ValueError(f"Unsupported export_strategy: {self.export_strategy}")
+        self.reproducibility_information = str(self.reproducibility_information).lower()
+        if self.reproducibility_information not in {"full", "basic", "none"}:
+            raise ValueError(
+                f"Unsupported reproducibility_information: {self.reproducibility_information}"
+            )
+        if self.scorers is not None:
+            if isinstance(self.scorers, str):
+                raise ValueError(
+                    "scorers must be a list of {plugin, optimization, instance_name} dicts"
+                )
+            normalized_scorers = []
+            for entry in self.scorers:
+                if isinstance(entry, str):
+                    entry = {"plugin": entry}
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        "Each scorer entry must be a dict with a 'plugin' key"
+                    )
+                if "plugin" not in entry:
+                    raise ValueError("Each scorer entry requires a 'plugin' key")
+                normalized_scorers.append(dict(entry))
+            self.scorers = normalized_scorers
+        if self.scorer_settings is not None and not isinstance(self.scorer_settings, dict):
+            raise ValueError("scorer_settings must be a dict of namespace tables")
+        if self.ignore_mismatches is not None and not isinstance(self.ignore_mismatches, bool):
+            raise ValueError("ignore_mismatches must be a boolean or None")
         if self.abliteration_trials < 1:
             raise ValueError("abliteration_trials must be at least 1")
         if self.abliteration_timeout < 1:
@@ -207,6 +290,8 @@ class Settings:
             raise ValueError("abliteration_evaluation_prompts must be at least 1")
         if self.batch_size < 1:
             raise ValueError("batch_size must be at least 1")
+        if self.abliteration_batch_size is not None and self.abliteration_batch_size < 0:
+            raise ValueError("abliteration_batch_size must be 0 (auto) or a positive int")
         if self.limit is not None and self.limit < 1:
             raise ValueError("limit must be at least 1 when specified")
         if self.num_fewshot < 0:

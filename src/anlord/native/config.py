@@ -13,10 +13,10 @@ equivalent values.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 
 
 class QuantizationMethod(str, Enum):
@@ -39,6 +39,7 @@ class ExportStrategy(str, Enum):
 class DatasetSpecification:
     dataset: str
     commit: Optional[str] = None
+    config: Optional[str] = None
     split: Optional[str] = None
     column: Optional[str] = None
     prefix: str = ""
@@ -46,6 +47,55 @@ class DatasetSpecification:
     system_prompt: Optional[str] = None
     residual_plot_label: Optional[str] = None
     residual_plot_color: Optional[str] = None
+
+
+@dataclass
+class ScorerConfig:
+    """
+    Configuration for a single scorer plugin.
+
+    The `plugin` is either a built-in reference such as
+    "anlord.scorers.keyword_rate.KeywordRate", a fully-qualified import path,
+    or a filesystem reference of the form "path/to/plugin.py:ClassName".
+
+    `optimization` is "minimize" / "maximize" to include the scorer as an
+    optimization objective, or "none" to compute the score without optimizing
+    for it. `instance_name` distinguishes multiple instances of the same
+    plugin class; instance-specific settings then live in `scorer_settings`
+    under the key "<ClassName>_<instance_name>".
+    """
+
+    plugin: str = "anlord.scorers.keyword_rate.KeywordRate"
+    optimization: str = "minimize"  # minimize | maximize | none
+    instance_name: Optional[str] = None
+
+    def validate(self) -> None:
+        if self.optimization not in {"minimize", "maximize", "none"}:
+            raise ValueError(
+                f"Unsupported scorer optimization: {self.optimization!r} "
+                '(expected "minimize", "maximize" or "none")'
+            )
+        if self.instance_name is not None:
+            name = self.instance_name
+            if not name.strip() or "." in name or any(c.isspace() for c in name):
+                raise ValueError(
+                    f"Invalid scorer instance_name: {name!r} "
+                    "(must be non-empty, without dots or whitespace)"
+                )
+
+
+def default_scorer_configs() -> List[ScorerConfig]:
+    """Default scorer set: refusals (keyword rate) and KL divergence, both minimized."""
+    return [
+        ScorerConfig(
+            plugin="anlord.scorers.keyword_rate.KeywordRate",
+            optimization="minimize",
+        ),
+        ScorerConfig(
+            plugin="anlord.scorers.kl_divergence.KLDivergence",
+            optimization="minimize",
+        ),
+    ]
 
 
 @dataclass
@@ -74,7 +124,7 @@ class NativeConfig:
 
     # generation / batching
     batch_size: int = 0  # 0 = auto
-    max_batch_size: int = 128
+    max_batch_size: int = 256
     max_response_length: int = 100
     response_prefix: Optional[str] = None
     chain_of_thought_skips: List[tuple[str, str]] = field(default_factory=lambda: [
@@ -93,12 +143,49 @@ class NativeConfig:
     residual_plot_style: str = "dark_background"
 
     # objective / KL
+    # Note: kl_divergence_scale / kl_divergence_target are legacy fields kept for
+    # config compatibility; with the scorer-plugin pipeline the objective values
+    # are the raw scorer values (see anlord/native/scorer.py).
     kl_divergence_scale: float = 1.0
     kl_divergence_target: float = 0.01
     orthogonalize_direction: bool = True
     row_normalization: RowNormalization = RowNormalization.FULL
     full_normalization_lora_rank: int = 3
     winsorization_quantile: float = 1.0
+
+    # scorers (extensible objective system)
+    scorers: List[ScorerConfig] = field(default_factory=default_scorer_configs)
+    # Raw settings tables for scorer instances, keyed by "<ClassName>" or
+    # "<ClassName>_<instance_name>". Only keys known to the scorer's settings
+    # schema are applied.
+    scorer_settings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # debug / reproducibility metadata
+    print_debug_information: bool = False
+    # Which reproduction information to generate at export: "full" (settings,
+    # package versions and system information), "basic" (settings and package
+    # versions), or "none".
+    reproducibility_information: str = "full"
+    # Reproduction mode: whether to attempt reproduction even if there are
+    # environment mismatches (None = proceed with a warning in the
+    # non-interactive pipeline, False = abort, True = proceed silently).
+    ignore_mismatches: Optional[bool] = None
+
+    # subspace (feature 1): multi-vector refusal subspace via SVD
+    refusal_subspace_rank: int = 1  # 1=legacy single vector, 3-5=subspace
+    refusal_subspace_method: str = "svd"
+
+    # Include list of model components to ablate (e.g. ["attn.o_proj"] to ablate
+    # only attention and leave MLP untouched). None = all abliterable components.
+    # Names are matched exactly or by prefix ("attn" matches "attn.o_proj").
+    abliteration_components: Optional[List[str]] = None
+
+    # capability proxy (feature 2): 3rd objective to preserve MMLU
+    capability_proxy_enabled: bool = False
+    capability_proxy_dataset: str = "cais/mmlu"
+    capability_proxy_subset: str = "abstract_algebra"
+    capability_proxy_samples: int = 20
+    capability_proxy_fewshot: int = 5
 
     # optimization
     n_trials: int = 100
@@ -192,9 +279,9 @@ class NativeConfig:
         bs = getattr(settings, "abliteration_batch_size", None)
         if bs is None:
             bs = 0
-        mbs = getattr(settings, "abliteration_max_batch_size", None) or 64
+        mbs = getattr(settings, "abliteration_max_batch_size", None) or 256
         if mbs is None:
-            mbs = 128
+            mbs = 256
 
         # trials
         n_trials = getattr(settings, "abliteration_trials", 100)
@@ -221,6 +308,66 @@ class NativeConfig:
         cache_dir = getattr(settings, "cache_dir", None)
         output_dir = getattr(settings, "output_dir", None)
 
+        # residual analysis (default plot location lives inside the output dir)
+        residual_plot_path = str(getattr(settings, "residual_plot_path", "plots") or "plots")
+        if residual_plot_path == "plots" and output_dir:
+            residual_plot_path = str(Path(output_dir) / "plots")
+
+        # scorer plugins
+        raw_scorers = getattr(settings, "scorers", None)
+        if raw_scorers:
+            scorers: List[ScorerConfig] = []
+            for entry in raw_scorers:
+                if isinstance(entry, ScorerConfig):
+                    scorer_cfg = entry
+                elif isinstance(entry, dict):
+                    scorer_cfg = ScorerConfig(**entry)
+                else:
+                    scorer_cfg = ScorerConfig(plugin=str(entry))
+                scorer_cfg.validate()
+                scorers.append(scorer_cfg)
+        else:
+            scorers = default_scorer_configs()
+
+        raw_scorer_settings = getattr(settings, "scorer_settings", None) or {}
+        scorer_settings: Dict[str, Dict[str, Any]] = {
+            str(namespace): dict(table or {})
+            for namespace, table in raw_scorer_settings.items()
+        }
+
+        # Keep the classic evaluation-prompt-count knob working for the built-in
+        # scorers: inject their prompt specifications unless the user already
+        # configured them in scorer_settings.
+        for scorer_cfg in scorers:
+            if not scorer_cfg.plugin.startswith("anlord."):
+                continue
+            class_name = scorer_cfg.plugin.rsplit(".", 1)[-1]
+            if class_name not in ("KeywordRate", "KLDivergence"):
+                continue
+            dataset = (
+                "mlabonne/harmful_behaviors"
+                if class_name == "KeywordRate"
+                else "mlabonne/harmless_alpaca"
+            )
+            prompts_default = {
+                "dataset": dataset,
+                "split": f"test[:{eval_count}]",
+                "column": "text",
+            }
+            table = scorer_settings.get(class_name)
+            if table is None:
+                scorer_settings[class_name] = {"prompts": prompts_default}
+            elif "prompts" not in table:
+                scorer_settings[class_name] = {**table, "prompts": prompts_default}
+
+        # export strategy
+        raw_export = getattr(settings, "export_strategy", None) or "merge"
+        export_strategy = ExportStrategy(str(raw_export).lower())
+
+        raw_repro_info = str(getattr(settings, "reproducibility_information", "full") or "full").lower()
+        if raw_repro_info not in {"full", "basic", "none"}:
+            raise ValueError(f"Unsupported reproducibility_information: {raw_repro_info}")
+
         return cls(
             model=getattr(settings, "model", "HuggingFaceTB/SmolLM2-135M"),
             model_commit=getattr(settings, "model_commit", None),
@@ -239,9 +386,72 @@ class NativeConfig:
             output_dir=Path(output_dir) if output_dir else None,
             dtype=str(dtype),
             study_checkpoint_dir=str((Path(output_dir) / "abliteration_study" / "checkpoints")) if output_dir else "checkpoints",
+            refusal_subspace_rank=int(getattr(settings, "abliteration_subspace_rank", 1) or 1),
+            refusal_subspace_method=str(getattr(settings, "abliteration_subspace_method", "svd")),
+            abliteration_components=(
+                [str(name) for name in settings.abliteration_components]
+                if getattr(settings, "abliteration_components", None)
+                else None
+            ),
+            capability_proxy_enabled=bool(getattr(settings, "capability_proxy_enabled", False) or getattr(settings, "capability_proxy", False)),
+            capability_proxy_dataset=str(getattr(settings, "capability_proxy_dataset", "cais/mmlu")),
+            capability_proxy_subset=str(getattr(settings, "capability_proxy_subset", "abstract_algebra")),
+            capability_proxy_samples=int(getattr(settings, "capability_proxy_samples", 20)),
+            capability_proxy_fewshot=int(getattr(settings, "capability_proxy_fewshot", 5)),
+            print_residual_geometry=bool(getattr(settings, "print_residual_geometry", False)),
+            plot_residuals=bool(getattr(settings, "plot_residuals", False)),
+            residual_plot_path=residual_plot_path,
+            residual_plot_title=str(getattr(settings, "residual_plot_title", NativeConfig.residual_plot_title)),
+            residual_plot_style=str(getattr(settings, "residual_plot_style", "dark_background")),
+            scorers=scorers,
+            scorer_settings=scorer_settings,
+            print_debug_information=bool(getattr(settings, "print_debug_information", False)),
+            reproducibility_information=raw_repro_info,
+            ignore_mismatches=getattr(settings, "ignore_mismatches", None),
+            export_strategy=export_strategy,
+            max_shard_size=getattr(settings, "max_shard_size", "5GB"),
         )
 
     def update_from_dict(self, overrides: dict) -> None:
-        for k, v in overrides.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
+        """
+        Applies overrides to this config, coercing serialized values (enums as
+        strings, dataclasses as dicts, lists of dataclasses) back to their
+        original types. None values are skipped so local paths survive.
+        """
+        for key, value in overrides.items():
+            if not hasattr(self, key) or value is None:
+                continue
+            current = getattr(self, key)
+            setattr(self, key, self._coerce_value(current, value))
+
+    @staticmethod
+    def _coerce_value(current: Any, value: Any) -> Any:
+        if isinstance(current, Enum) and not isinstance(value, Enum):
+            try:
+                return type(current)(value)
+            except ValueError:
+                return value
+        if is_dataclass(current) and not isinstance(current, type) and isinstance(value, dict):
+            coerced = {}
+            current_fields = {f.name: f for f in fields(current)}
+            for field_key, field_value in value.items():
+                if field_key not in current_fields:
+                    continue
+                default = getattr(current, field_key)
+                coerced[field_key] = NativeConfig._coerce_value(default, field_value)
+            return type(current)(**coerced)
+        if isinstance(current, list) and isinstance(value, list):
+            template = current[0] if current else None
+            if (
+                template is not None
+                and is_dataclass(template)
+                and not isinstance(template, type)
+            ):
+                return [
+                    NativeConfig._coerce_value(template, item) if isinstance(item, dict) else item
+                    for item in value
+                ]
+            return value
+        if isinstance(current, tuple) and isinstance(value, list):
+            return tuple(value)
+        return value

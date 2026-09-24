@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""
+KL-divergence scorer: measures how far the model's first-token behavior has
+drifted from the baseline model. Lower is better (less capability damage).
+"""
+
+from __future__ import annotations
+
+import torch.nn.functional as F
+from pydantic import BaseModel, Field
+
+from ..config import DatasetSpecification
+from ..plugin import Context
+from ..prompts import Prompt
+from ..scorer import Score, Scorer
+from ..utils import print
+
+
+class Settings(BaseModel):
+    prompts: DatasetSpecification = Field(
+        default=DatasetSpecification(
+            dataset="mlabonne/harmless_alpaca",
+            split="test[:100]",
+            column="text",
+        ),
+        description="Prompt dataset used to measure KL divergence from original model.",
+    )
+
+
+class KLDivergence(Scorer):
+    """
+    KL divergence between current model and baseline.
+
+    Measures how much the model's behavior has drifted from baseline.
+    Lower is better (less damage).
+    """
+
+    settings: Settings
+
+    @property
+    def reproducible(self) -> bool:
+        return True
+
+    @property
+    def score_name(self) -> str:
+        return "KL divergence"
+
+    def init(self, ctx: Context) -> None:
+        print()
+        print(
+            f"Loading KL divergence evaluation prompts from "
+            f"[bold]{self.settings.prompts.dataset}[/]..."
+        )
+        self.prompts: list[Prompt] = ctx.load_prompts(self.settings.prompts)
+        print(f"* [bold]{len(self.prompts)}[/] prompts loaded")
+
+        print("* Obtaining baseline first-token probability distributions...")
+        baseline_logits = ctx.get_logits(self.prompts)
+
+        self._baseline_logprobs = F.log_softmax(baseline_logits, dim=-1)
+
+    def get_score(self, ctx: Context) -> Score:
+        logits = ctx.get_logits(self.prompts)
+        logprobs = F.log_softmax(logits, dim=-1)
+
+        kl_divergence = F.kl_div(
+            logprobs,
+            self._baseline_logprobs,
+            reduction="batchmean",
+            log_target=True,
+        ).item()
+
+        # Legacy metric extraction: the pipeline reports the raw KL value
+        # alongside the scores, so remember the most recent value.
+        self.last_kl_value = kl_divergence
+
+        return Score(
+            value=kl_divergence,
+            rich_display=f"[bold]{kl_divergence:.4f}[/]",
+            md_display=f"{kl_divergence:.4f}",
+        )
+
+    def get_baseline_score(self, ctx: Context) -> Score:
+        return Score(
+            value=0,
+            rich_display="[bold]0[/] [italic](by definition)[/]",
+            md_display="0 *(by definition)*",
+        )

@@ -31,6 +31,11 @@
 | | What it does |
 |---|---|
 | **🔧 Native abliteration** | In-process Optuna search over refusal direction & layer weights, Pareto selection (`refusals ↓` + `KL ↓`), merges LoRA into base model |
+| **🧩 Scorer plugins** | Extensible objectives: built-in `Refusals`, `KL divergence`, `BenchmarkScore` (lm-eval) — or load your own from a `.py` file / import path. Multiple instances, per-scorer settings, `minimize` / `maximize` / `none` per objective |
+| **📐 Residual analysis** | `--print-residual-geometry`: per-layer cosine similarities, norms & silhouettes (means + geometric medians); `--plot-residuals`: PaCMAP projections per layer + animated GIF (optional `research` extra) |
+| **♻️ Reproduction mode** | Every run saves full ablation parameters + a shareable `reproduce/` bundle (settings, scores, package versions, SHA-256 hashes, Optuna journal). `--reproduce <file \| user/model \| HF URL>` re-applies a published ablation and verifies weight hashes byte-for-byte |
+| **🎚️ Component filter** | `--components attn` ablates only attention and leaves MLP untouched (prefix matching, recorded in bundles, reproducible) |
+| **📤 Export strategy** | `--export-strategy merge` (default, full model) or `adapter` (LoRA only) — the actually used strategy is recorded everywhere |
 | **⬇️ Visible downloads** | `huggingface_hub.snapshot_download` with progress bars into `cache/hub` |
 | **🔐 Ephemeral HF auth** | Optional `HF_TOKEN` kept only in the current process (`questionary` masked prompt). `Enter` = anonymous. `--no-hf-token-prompt` for CI |
 | **📊 Native runner (default)** | Custom evaluators on `datasets` + `transformers` — no `lm-eval` required, works offline, tolerant to `trust_remote_code` deprecation |
@@ -84,6 +89,8 @@ anlord_env\Scripts\activate
 python -m pip install -U pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install -e .
+# optional: residual geometry + PaCMAP plots
+pip install -e .[research]
 # optional: lm-eval harness for exact leaderboard reproduction
 pip install -e .[lmeval]
 ```
@@ -100,6 +107,14 @@ Verify:
 ```bash
 python -m src.anlord --info
 pytest tests/ -v
+```
+
+The distribution installs as **AnlordAbliterator** (pip name) and provides the
+`AnlordAbliterator` console command; the importable package is `anlord`.
+Most people run it from the project root (the folder above `src`):
+
+```bash
+python -m src.anlord --info
 ```
 
 ## Quick Start
@@ -196,6 +211,23 @@ Abliteration:
   --backend              native | auto (default native)
   --row-normalization    none | pre | full (default full)
   --no-orthogonalize     disable projected abliteration
+  --subspace-rank        1 = single direction, 3-5 = multi-vector subspace via SVD
+  --capability-proxy     3rd Optuna objective: tiny MMLU proxy (refusals ↓ KL ↓ MMLU ↑)
+  --components           comma-separated include list, e.g. '--components attn' = attention-only
+  --scorers              scorer plugins as JSON or a JSON file path
+
+Residual analysis (optional 'research' extra):
+  --print-residual-geometry   per-layer geometry table (also saved to file + JSON)
+  --plot-residuals            PaCMAP plots per layer + animated GIF
+  --residual-plot-path        plots directory (default: <output>/plots)
+
+Export / reproduction:
+  --export-strategy      merge (default) | adapter (LoRA only)
+  --max-shard-size       safetensors shard size (default 5GB)
+  --reproducibility-info full | basic | none  (reproduction bundle contents)
+  --reproduce            reproduce.json path, 'user/model' repo id, or HF model URL
+  --ignore-mismatches    reproduce despite environment differences (default: warn)
+  --print-debug-information
 
 Benchmarks:
   --tasks, --benchmarks, -b   see table above
@@ -209,7 +241,8 @@ Hardware (load-time only, not saved):
   --device               cuda | cpu | mps
   --device-map           auto | cuda | cpu
   --quantization         auto | none | bnb_4bit | bnb_8bit  (how to fit model in VRAM)
-  --batch-size           (default 1)
+  --batch-size           inference batch for abliteration (refusal counting); omit to
+                         autotune from VRAM headroom (default: autotune)
   --max-memory           e.g. '{"0":"7GB","cpu":"11GB"}'
 
 Pipeline:
@@ -235,14 +268,26 @@ output/
 │   │   ├── config.json
 │   │   ├── tokenizer.json
 │   │   ├── model.safetensors (or shards)
-│   │   └── abliteration_metrics.json
+│   │   ├── native_abliteration_metrics.json
+│   │   ├── abliteration_reproduction.json   # full ablation parameters (--reproduce ready)
+│   │   ├── abliteration_pareto_front.json   # all Pareto trials + refusals/KL
+│   │   ├── pareto_trials/trial_N.json       # each Pareto trial as a reproduce file
+│   │   └── reproduce/                       # shareable bundle (if fully pinned)
+│   │       ├── reproduce.json · SHA256SUMS
+│   │       ├── requirements.txt · config.json · README.md
+│   │       └── <model>.jsonl                # Optuna journal copy
 │   ├── abliteration_study/                  # Optuna study (for resume)
 │   └── abliteration_baseline/               # baseline metrics
+├── plots/<model>/                           # residual analysis (if enabled)
+│   ├── layer_001.png … · animation.gif
+│   ├── residual_geometry.txt
+│   └── residual_geometry.json
 ├── results/
 │   ├── baseline/*.json
 │   ├── abliterated/*.json
 │   ├── comparison.json
-│   └── ablation.json
+│   ├── abliteration.json
+│   └── reproduction_hashes.json             # reproduction mode only
 ├── reports/
 │   ├── report.html
 │   ├── report.json
@@ -258,6 +303,50 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained("output/models/abliterated", trust_remote_code=True, device_map="auto")
 tok = AutoTokenizer.from_pretrained("output/models/abliterated", trust_remote_code=True)
 ```
+
+## Reproduce a published model
+
+Every run saves the complete ablation recipe next to the model. To re-apply someone else's
+ablation (or your own on another machine) and verify the weights byte-for-byte:
+
+```bash
+# from a local reproduce.json / saved trial file
+python -m src.anlord --reproduce "C:/models/Qwen3.5-0.8B/models/abliterated/reproduce/reproduce.json"
+# straight from Hugging Face
+python -m src.anlord --reproduce username/model-name
+# after `pip install AnlordAbliterator` the same run is just:
+AnlordAbliterator --reproduce username/model-name
+```
+
+The pipeline restores the original settings and parameters, re-applies the ablation, exports
+the model and checks the SHA-256 hashes of the weight files (`reproduction_hashes.json`).
+Environment differences are reported in a table; `--ignore-mismatches` proceeds anyway.
+
+## Scorer plugins
+
+Objectives are plugins. Defaults: refusals (keyword rate) + KL divergence, both minimized.
+Add your own via the `--scorers` JSON (or the `scorers` / `scorer_settings` settings):
+
+```json
+{
+  "scorers": [
+    {"plugin": "anlord.scorers.keyword_rate.KeywordRate", "optimization": "minimize", "instance_name": "refusals"},
+    {"plugin": "anlord.scorers.kl_divergence.KLDivergence", "optimization": "minimize"},
+    {"plugin": "anlord.scorers.benchmark_score.BenchmarkScore", "optimization": "maximize",
+     "instance_name": "piqa"},
+    {"plugin": "C:/plugins/my_scorer.py:MyScorer", "optimization": "none"}
+  ],
+  "scorer_settings": {
+    "KeywordRate_refusals": {"score_name": "Refusals"},
+    "BenchmarkScore_piqa": {"score_name": "PIQA acc_norm", "task": "piqa", "metric": "acc_norm,none"}
+  }
+}
+```
+
+Built-in plugins live under the `anlord.scorers.*` namespace; external ones are referenced as
+`path/to/plugin.py:ClassName` or `module.submodule.ClassName`. Only runs whose model and
+datasets are pinned Hugging Face paths and whose scorers are all reproducible built-ins get a
+reproduction bundle.
 
 ## GGUF Quantization
 

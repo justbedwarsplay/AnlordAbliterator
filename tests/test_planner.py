@@ -164,3 +164,97 @@ def test_windows_access_violation_exit_code_is_explained():
     assert "without quantization" not in message
     assert "--no-resume" not in message
     assert "CausalLM" in message
+
+
+def test_two_b_4bit_on_small_gpu_gets_predictive_autotune():
+    """2B with 4-bit on a small card: quantized load fits wholly in VRAM -> autotune."""
+    plan = plan_model_load(
+        model_id="Qwen/Qwen3.5-2B",
+        device="cuda",
+        dtype="auto",
+        quantization="auto",
+        vram_gb=4.0,
+        ram_gb=16.0,
+        available_ram_gb=10.0,
+        commit_limit_gb=24.0,
+        platform_name="nt",
+    )
+
+    assert plan.quantization == "bnb_4bit"
+    assert plan.device_map == "cuda"
+    assert plan.abliteration_batch_size == 0
+    assert plan.abliteration_max_batch_size == 256
+
+
+def test_two_b_full_precision_tight_fit_gets_predictive_autotune():
+    """2B full precision just fits on 6 GB -> predictive autotune up to 256, not locked to 1."""
+    plan = plan_model_load(
+        model_id="Qwen/Qwen3.5-2B",
+        device="cuda",
+        dtype="auto",
+        quantization="auto",
+        vram_gb=6.0,
+        ram_gb=16.0,
+        available_ram_gb=10.0,
+        commit_limit_gb=24.0,
+        platform_name="posix",
+    )
+
+    assert plan.quantization == "none"
+    assert plan.max_memory is not None
+    assert plan.abliteration_batch_size == 0
+    assert plan.abliteration_max_batch_size == 256
+
+
+def test_offloaded_model_still_locks_batch_to_one():
+    """Model whose 4-bit load spills into CPU offload keeps batch 1."""
+    plan = plan_model_load(
+        model_id="unsloth/gpt-oss-20b-BF16",
+        device="cuda",
+        dtype="auto",
+        quantization="auto",
+        weight_gb=41.8,
+        vram_gb=8.0,
+        ram_gb=16.0,
+        available_ram_gb=8.0,
+        commit_limit_gb=24.0,
+        platform_name="posix",
+    )
+
+    assert plan.abliteration_batch_size == 1
+    assert plan.abliteration_max_batch_size == 1
+
+
+def test_cpu_device_falls_back_to_probe_autotune_max_256():
+    plan = plan_model_load(
+        model_id="Qwen/Qwen3.5-2B",
+        device="cpu",
+        dtype="auto",
+        quantization="auto",
+        vram_gb=0.0,
+        ram_gb=16.0,
+        available_ram_gb=10.0,
+        commit_limit_gb=24.0,
+        platform_name="posix",
+    )
+
+    assert plan.abliteration_batch_size == 0
+    assert plan.abliteration_max_batch_size == 256
+
+
+def test_comfortable_fit_keeps_max_batch_256():
+    """0.8B on 8 GB: uniform autotune ceiling of 256 (predictive on CUDA)."""
+    plan = plan_model_load(
+        model_id="Qwen/Qwen3.5-0.8B",
+        device="cuda",
+        dtype="auto",
+        quantization="auto",
+        vram_gb=8.0,
+        ram_gb=16.0,
+        available_ram_gb=10.0,
+        commit_limit_gb=24.0,
+        platform_name="nt",
+    )
+
+    assert plan.abliteration_batch_size == 0
+    assert plan.abliteration_max_batch_size == 256

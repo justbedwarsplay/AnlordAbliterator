@@ -207,27 +207,51 @@ def plan_model_load(
             "at least 64 GB before retrying."
         )
 
-    # Task 1: smart batch choice — if weights fit comfortably (×4 headroom) allow autotune/max 64,
-    # otherwise lock to 1. This replaces the old conservative tight_gpu lock that forced batch 1
-    # even for 0.8B on 8 GB (1.6 GB *4 = 6.4 ≤ 8 → auto). Keep max_batch_size = 64 for autotune.
-    if estimated_weight and vram_gb > 0 and estimated_weight * 4 <= vram_gb:
+    # Task 1 (rev. 3): batch choice. The native autotuner is predictive for EVERY CUDA
+    # model — quantized or full precision: it measures the per-batch VRAM coefficient
+    # starting from batch 1 and only attempts the next power of two when the
+    # extrapolated peak still fits into the free headroom, so an oversized batch is
+    # rejected on paper instead of OOM-ing the process (a bitsandbytes OOM on Windows
+    # can be an uncatchable 0xC0000005). All autotune ceilings are uniform (256);
+    # batch 1 is forced only for CPU/pagefile offload paths, where PCIe round-trips
+    # negate batching anyway.
+    if device_map == "cuda":
+        gpu_allowance_gb = float("inf")
+    elif max_memory and "0" in max_memory:
+        try:
+            gpu_allowance_gb = float(str(max_memory["0"]).removesuffix("GB"))
+        except ValueError:
+            gpu_allowance_gb = 0.0
+    else:
+        gpu_allowance_gb = 0.0
+    offloads_to_ram = (
+        device != "cpu"
+        and bool(max_memory and "cpu" in max_memory)
+        and load_gb > gpu_allowance_gb
+    )
+
+    if device == "cpu":
+        # No VRAM metering available: fall back to probe-and-catch autotune, which
+        # relies on OOM being a recoverable exception outside bitsandbytes kernels.
         batch_size = 0
-        max_batch_size = 64
+        max_batch_size = 256
         reasons.append(
-            f"Abliteration batch size: auto (max {max_batch_size}) | weights {estimated_weight:.1f} GB, VRAM {vram_gb:.1f} GB"
+            "Abliteration batch size: probe autotune (max 256) | CPU device, trying powers of two"
+        )
+    elif offloads_to_ram:
+        batch_size = 1
+        max_batch_size = 1
+        reasons.append(
+            "Abliteration batch size locked to 1 to reduce peak memory "
+            "(model does not fit wholly in VRAM; layers offload to CPU/pagefile)"
         )
     else:
-        tight_gpu = device != "cpu" and 0 < vram_gb < 12
-        if tight_gpu or abliteration_quantization == "bnb_4bit":
-            batch_size = 1
-            max_batch_size = 1
-            reasons.append("Abliteration batch size locked to 1 to reduce peak memory")
-        else:
-            batch_size = 0
-            max_batch_size = 64
-            reasons.append(
-                f"Abliteration batch size: auto (max {max_batch_size}) | weights {estimated_weight:.1f} GB, VRAM {vram_gb:.1f} GB"
-            )
+        batch_size = 0
+        max_batch_size = 256
+        reasons.append(
+            f"Abliteration batch size: predictive VRAM autotune (max {max_batch_size}) | "
+            f"resident load ~{load_gb:.1f} GB fits VRAM {vram_gb:.1f} GB"
+        )
 
     return LoadPlan(
         quantization=resolved,

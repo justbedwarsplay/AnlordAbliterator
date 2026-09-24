@@ -120,6 +120,99 @@ Examples:
         default=False,
         help="Disable orthogonalized direction (projected abliteration)",
     )
+    abliteration_group.add_argument(
+        "--subspace-rank",
+        type=int,
+        default=1,
+        help="Refusal subspace rank: 1=single vector (legacy), 3-5=subspace via SVD (better KL)",
+    )
+    abliteration_group.add_argument(
+        "--capability-proxy",
+        action="store_true",
+        default=False,
+        help="Enable 3-objective Optuna with tiny MMLU proxy to preserve capability (refusals ↓, KL ↓, MMLU ↑)",
+    )
+    abliteration_group.add_argument(
+        "--scorers",
+        type=str,
+        default=None,
+        help='Scorer plugin configs as JSON (list of {plugin, optimization, instance_name}) '
+        "or a path to a JSON file. Default: refusals + KL divergence (both minimized)",
+    )
+    abliteration_group.add_argument(
+        "--components",
+        type=str,
+        default=None,
+        help="Comma-separated include list of model components to ablate; names match "
+        "exactly or by prefix. Example: '--components attn' ablates only attention and "
+        "leaves MLP untouched. Default: all abliterable components",
+    )
+
+    # Residual analysis
+    residual_group = parser.add_argument_group("Residual Analysis")
+    residual_group.add_argument(
+        "--print-residual-geometry",
+        action="store_true",
+        default=False,
+        help="Print per-layer residual geometry (cosine similarities, norms, silhouettes)",
+    )
+    residual_group.add_argument(
+        "--plot-residuals",
+        action="store_true",
+        default=False,
+        help="Generate PaCMAP projection plots of residual vectors (per layer + animation)",
+    )
+    residual_group.add_argument(
+        "--residual-plot-path",
+        type=str,
+        default=None,
+        help="Base directory for residual plots (default: <output>/plots)",
+    )
+
+    # Export / reproduction
+    export_group = parser.add_argument_group("Export / Reproduction")
+    export_group.add_argument(
+        "--export-strategy",
+        type=str,
+        choices=["merge", "adapter"],
+        default=None,
+        help="How to export the model: merge the abliteration LoRA into full weights (default), "
+        "or save the LoRA adapter only",
+    )
+    export_group.add_argument(
+        "--max-shard-size",
+        type=str,
+        default=None,
+        help="Maximum size for individual safetensors shards when exporting (default: 5GB)",
+    )
+    export_group.add_argument(
+        "--reproducibility-info",
+        type=str,
+        choices=["full", "basic", "none"],
+        default=None,
+        help="Which reproduction information to generate next to the exported model "
+        "(default: full)",
+    )
+    export_group.add_argument(
+        "--reproduce",
+        type=str,
+        default=None,
+        help="Path or URL of a reproduce.json file: restore the stored ablation, re-apply it, "
+        "export the model, and verify weight file hashes",
+    )
+    export_group.add_argument(
+        "--ignore-mismatches",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Attempt reproduction even if the local environment doesn't match the original "
+        "(default: proceed with a warning)",
+    )
+    export_group.add_argument(
+        "--print-debug-information",
+        action="store_true",
+        default=False,
+        help="Print additional debugging information (torch config, thread counts)",
+    )
 
     # Benchmark configuration
     benchmark_group = parser.add_argument_group("Benchmark Configuration")
@@ -170,7 +263,13 @@ Examples:
         default="auto",
         help="Quantization method (auto enables 4-bit when the model cannot fit)",
     )
-    hardware_group.add_argument("--batch-size", type=int, default=1, help="Batch size")
+    hardware_group.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Inference batch size for abliteration (refusal counting / generation). "
+        "Omit to autotune from VRAM headroom. Benchmarks use their own batch.",
+    )
 
     # Pipeline options
     pipeline_group = parser.add_argument_group("Pipeline Options")
@@ -258,6 +357,25 @@ def run_from_args(args: argparse.Namespace) -> Settings:
     else:
         limit = args.limit if args.limit is not None else 100
 
+    # Parse scorer configs (inline JSON or path to a JSON file)
+    scorers = None
+    if getattr(args, "scorers", None):
+        import json as _json
+
+        scorers_raw = args.scorers
+        try:
+            if scorers_raw.strip().startswith("["):
+                scorers = _json.loads(scorers_raw)
+            else:
+                scorers = _json.loads(Path(scorers_raw).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Invalid --scorers value: {error}") from error
+
+    # Parse the component include list (comma-separated)
+    components = None
+    if getattr(args, "components", None):
+        components = [c.strip() for c in args.components.split(",") if c.strip()]
+
     # Build settings
     settings = Settings(
         model=args.model or "unsloth/gpt-oss-20b-BF16",
@@ -271,6 +389,20 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         abliteration_backend=getattr(args, "backend", "native"),
         row_normalization=getattr(args, "row_normalization", "full"),
         orthogonalize_direction=not getattr(args, "no_orthogonalize", False),
+        abliteration_subspace_rank=getattr(args, "subspace_rank", 1),
+        capability_proxy=getattr(args, "capability_proxy", False),
+        capability_proxy_enabled=getattr(args, "capability_proxy", False),
+        abliteration_components=components,
+        scorers=scorers,
+        print_residual_geometry=getattr(args, "print_residual_geometry", False),
+        plot_residuals=getattr(args, "plot_residuals", False),
+        residual_plot_path=getattr(args, "residual_plot_path", None) or "plots",
+        export_strategy=getattr(args, "export_strategy", None) or "merge",
+        max_shard_size=getattr(args, "max_shard_size", None) or "5GB",
+        reproducibility_information=getattr(args, "reproducibility_info", None) or "full",
+        reproduce=getattr(args, "reproduce", None),
+        ignore_mismatches=getattr(args, "ignore_mismatches", None),
+        print_debug_information=getattr(args, "print_debug_information", False),
         benchmarks=benchmarks,
         mode=selected_mode,
         limit=limit,
@@ -279,7 +411,8 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         dtype=args.dtype,
         device=args.device,
         quantization=args.quantization,
-        batch_size=args.batch_size,
+        batch_size=1,
+        abliteration_batch_size=args.batch_size,
         skip_baseline=args.skip_baseline,
         skip_abliteration=args.skip_abliteration,
         skip_benchmarks=args.skip_benchmarks,
@@ -305,6 +438,97 @@ def run_interactive() -> Settings:
     return prompter.run_full_prompts()
 
 
+def apply_explicit_cli_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
+    """
+    Applies explicitly-provided CLI arguments on top of settings obtained from
+    the interactive prompter.
+
+    When the pipeline runs interactively (no --model on the command line), the
+    interactive prompts still win for everything they ask about — but arguments
+    the user passed explicitly (e.g. --batch-size 128, --export-strategy,
+    --skip-benchmarks) must not be silently ignored. Only values that are
+    detectably explicit (differ from the parser defaults) are applied.
+    """
+    if args.batch_size is not None:
+        settings.abliteration_batch_size = args.batch_size
+    if args.trials is not None:
+        settings.abliteration_trials = args.trials
+    if args.model_commit is not None:
+        settings.model_commit = args.model_commit
+    if args.output is not None:
+        settings.output_dir = Path(args.output)
+    if args.cache_dir is not None:
+        settings.cache_dir = Path(args.cache_dir)
+
+    # Benchmarks / mode / limit (explicit only)
+    if args.tasks:
+        from ..benchmarks.tasks import expand_task_list
+
+        raw = args.tasks.strip()
+        if raw.lower() in ["*", "full", "extended", "standard", "academic", "reasoning", "parsing", "vision", "gpqa"]:
+            settings.benchmarks = expand_task_list([raw])
+        elif raw.lower() == "all":
+            settings.benchmarks = expand_task_list(["extended"])
+        else:
+            settings.benchmarks = expand_task_list(
+                [b.strip() for b in raw.split(",") if b.strip()]
+            )
+    if args.mode:
+        settings.mode = RunMode.QUICK if args.mode == "quick" else RunMode.FULL
+        settings.limit = None if settings.mode == RunMode.FULL else (args.limit or 100)
+    elif args.limit is not None:
+        settings.limit = args.limit
+
+    # Export / reproduction (explicit only)
+    if getattr(args, "export_strategy", None):
+        settings.export_strategy = args.export_strategy
+    if getattr(args, "max_shard_size", None):
+        settings.max_shard_size = args.max_shard_size
+    if getattr(args, "reproducibility_info", None):
+        settings.reproducibility_information = args.reproducibility_info
+    if getattr(args, "reproduce", None):
+        settings.reproduce = args.reproduce
+    if getattr(args, "ignore_mismatches", None) is not None:
+        settings.ignore_mismatches = args.ignore_mismatches
+    if getattr(args, "scorers", None):
+        settings.scorers = args.scorers
+    if getattr(args, "components", None):
+        settings.abliteration_components = [
+            c.strip() for c in args.components.split(",") if c.strip()
+        ]
+    if getattr(args, "residual_plot_path", None):
+        settings.residual_plot_path = args.residual_plot_path
+
+    # Flags (store_true: apply only when explicitly set)
+    if args.skip_baseline:
+        settings.skip_baseline = True
+    if args.skip_abliteration:
+        settings.skip_abliteration = True
+    if args.skip_benchmarks:
+        settings.skip_benchmarks = True
+    if getattr(args, "no_orthogonalize", False):
+        settings.orthogonalize_direction = False
+    if getattr(args, "capability_proxy", False):
+        settings.capability_proxy = True
+        settings.capability_proxy_enabled = True
+    if getattr(args, "print_residual_geometry", False):
+        settings.print_residual_geometry = True
+    if getattr(args, "plot_residuals", False):
+        settings.plot_residuals = True
+    if getattr(args, "print_debug_information", False):
+        settings.print_debug_information = True
+    if getattr(args, "baseline_evaluate", False):
+        settings.baseline_evaluate = True
+
+    # Output verbosity
+    if getattr(args, "quiet", False):
+        settings.verbose = False
+    elif getattr(args, "verbose", False):
+        settings.verbose = True
+
+    return settings
+
+
 def main():
     """Main entry point for CLI."""
     parser = create_parser()
@@ -327,7 +551,9 @@ def main():
     run_interactive_mode = args.model is None and sys.stdin.isatty()
 
     if run_interactive_mode:
-        settings = run_interactive()
+        # Interactive prompts answer the questionnaire; explicitly passed CLI
+        # arguments (e.g. --batch-size 128) still override the results.
+        settings = apply_explicit_cli_overrides(run_interactive(), args)
     else:
         settings = run_from_args(args)
 

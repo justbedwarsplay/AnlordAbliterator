@@ -179,6 +179,30 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
+        # Validate the component include list before applying LoRA (an empty
+        # match would otherwise surface as a confusing PEFT error later).
+        available_components: set[str] = set()
+        for layer_index in range(len(self.get_layers())):
+            available_components.update(
+                self.get_layer_modules(layer_index, apply_include_filter=False).keys()
+            )
+        if self.settings.abliteration_components:
+            print(
+                f"* Component include list active: only "
+                f"[bold]{', '.join(self.settings.abliteration_components)}[/] will be ablated"
+            )
+            if not any(
+                self._component_included(component, self.settings.abliteration_components)
+                for component in available_components
+            ):
+                raise ValueError(
+                    f"None of the configured components "
+                    f"{self.settings.abliteration_components} match this model's abliterable "
+                    f"components {sorted(available_components)}. Component names follow the "
+                    "pattern 'attn.o_proj' / 'mlp.down_proj'; prefix matching is supported "
+                    "(e.g. 'attn')."
+                )
+
         self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
@@ -389,7 +413,9 @@ class Model:
         # Text-only models.
         return model.model.layers
 
-    def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
+    def get_layer_modules(
+        self, layer_index: int, *, apply_include_filter: bool = True
+    ) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
 
         modules = {}
@@ -457,7 +483,27 @@ class Model:
         total_modules = sum(len(mods) for mods in modules.values())
         assert total_modules > 0, "No abliterable modules found in layer"
 
+        # Component include list (e.g. attention-only ablation): excluded
+        # components are dropped here, which filters everything downstream —
+        # LoRA targeting, the optimization parameter space, and abliteration.
+        # A layer left without included modules simply has nothing to ablate.
+        included = getattr(self.settings, "abliteration_components", None)
+        if included and apply_include_filter:
+            modules = {
+                component: layer_modules
+                for component, layer_modules in modules.items()
+                if self._component_included(component, included)
+            }
+
         return modules
+
+    @staticmethod
+    def _component_included(component: str, included: list[str]) -> bool:
+        """A component matches an include entry by exact name or by prefix
+        (e.g. "attn" matches "attn.o_proj")."""
+        return any(
+            component == name or component.startswith(name) for name in included
+        )
 
     def get_abliterable_components(self) -> list[str]:
         components: set[str] = set()
@@ -475,20 +521,38 @@ class Model:
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
     ):
-        if direction_index is None:
-            refusal_direction = None
+        # Subspace support: refusal_directions may be [layers, hidden] (legacy) or [layers, k, hidden] (subspace)
+        is_subspace = refusal_directions.dim() == 3
+        subspace_k = refusal_directions.shape[1] if is_subspace else 1
+
+        if is_subspace:
+            # For subspace, handle direction_index by interpolating each of k vectors between layers
+            if direction_index is None:
+                refusal_direction = None  # per-layer: use layer-specific subspace
+            else:
+                weight, index = math.modf(direction_index + 1)
+                # Interpolate each subspace vector between index and index+1
+                # refusal_directions: [L, k, H]
+                low = refusal_directions[int(index)]  # [k, H]
+                high = refusal_directions[int(index) + 1]  # [k, H]
+                # lerp per vector
+                refusal_direction = low.lerp(high, weight)  # [k, H]
+                refusal_direction = F.normalize(refusal_direction, p=2, dim=1)
         else:
-            # The index must be shifted by 1 because the first element
-            # of refusal_directions is the direction for the embeddings.
-            weight, index = math.modf(direction_index + 1)
-            refusal_direction = F.normalize(
-                refusal_directions[int(index)].lerp(
-                    refusal_directions[int(index) + 1],
-                    weight,
-                ),
-                p=2,
-                dim=0,
-            )
+            if direction_index is None:
+                refusal_direction = None
+            else:
+                # The index must be shifted by 1 because the first element
+                # of refusal_directions is the direction for the embeddings.
+                weight, index = math.modf(direction_index + 1)
+                refusal_direction = F.normalize(
+                    refusal_directions[int(index)].lerp(
+                        refusal_directions[int(index) + 1],
+                        weight,
+                    ),
+                    p=2,
+                    dim=0,
+                )
 
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
@@ -510,107 +574,163 @@ class Model:
                     params.min_weight - params.max_weight
                 )
 
-                if refusal_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of refusal_directions is the direction for the embeddings.
-                    layer_refusal_direction = refusal_directions[layer_index + 1]
+                # Resolve refusal direction(s) for this layer
+                if is_subspace:
+                    if refusal_direction is None:
+                        # per-layer subspace: [k, H]
+                        layer_vectors = refusal_directions[layer_index + 1]  # [k, H]
+                    else:
+                        # global subspace: [k, H] already interpolated
+                        layer_vectors = refusal_direction  # [k, H]
+                    # layer_vectors is [k, H], will be handled per-module below
+                    # For non-subspace path, layer_refusal_direction is [H]
+                    layer_refusal_direction = None  # marker for subspace
                 else:
-                    layer_refusal_direction = refusal_direction
+                    if refusal_direction is None:
+                        # The index must be shifted by 1 because the first element
+                        # of refusal_directions is the direction for the embeddings.
+                        layer_refusal_direction = refusal_directions[layer_index + 1]
+                    else:
+                        layer_refusal_direction = refusal_direction
+                    layer_vectors = None
 
                 for module in modules:
-                    # FIXME: This cast is potentially invalid, because the program logic
-                    #        does not guarantee that the module is of type Linear, and in fact
-                    #        the retrieved modules might not conform to the interface assumed
-                    #        below (though they do in practice). However, this is difficult
-                    #        to fix cleanly, because get_layer_modules is called twice on
-                    #        different model configurations, and PEFT employs different
-                    #        module types depending on the chosen quantization.
                     module = cast(Linear, module)
 
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
-
-                    # Use the FP32 refusal direction directly (no downcast/upcast)
-                    # and move to the correct device.
-                    v = layer_refusal_direction.to(module.weight.device)
-
                     # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
                     base_weight = cast(Tensor, module.base_layer.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
                         W = base_weight.to(torch.float32)
                     else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
                         W = cast(
                             Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                            bnb.functional.dequantize_4bit(
                                 base_weight.data,
                                 quant_state,
                             ).to(torch.float32),
                         )
 
-                    # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
 
                     if self.settings.row_normalization != RowNormalization.NONE:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
                         W_org = W
-                        # Get the row norms.
                         W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
-                        # Normalize the weight matrix along the rows.
                         W = F.normalize(W, p=2, dim=1)
 
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
+                    # --- Subspace vs single vector handling ---
+                    if is_subspace:
+                        # layer_vectors: [k, H]
+                        # Compute combined delta for all k vectors
+                        # For NONE/PRE we sum contributions; for FULL we sum then do single SVD
+                        k = layer_vectors.shape[0]
+                        # Weight per vector: distribute original weight across subspace
+                        # Use equal weighting; alternative: weight / k per vector keeps total norm similar
+                        # We use weight / sqrt(k) to preserve norm, then sum
+                        # Simple: weight_per = weight / k
+                        weight_per = weight / max(1, k)
+                        # For FULL, we need to accumulate delta before SVD
+                        # For NONE/PRE we can compute directly
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            # Accumulate delta in W space
+                            delta = torch.zeros_like(W)
+                            for vi in range(k):
+                                v = layer_vectors[vi].to(module.weight.device)
+                                # v is (H,), need to ensure H == W.shape[0] (out_features)
+                                # For some layers out may be different, but H is hidden size, should match
+                                if v.shape[0] != W.shape[0]:
+                                    # Skip mismatched (should not happen)
+                                    continue
+                                lora_A_i = (v @ W).view(1, -1)
+                                lora_B_i = (-weight_per * v).view(-1, 1)
+                                delta = delta + lora_B_i @ lora_A_i
+                            # Now apply FULL logic with combined delta
+                            W = W + delta
+                            W = F.normalize(W, p=2, dim=1)
+                            W = W * W_row_norms
+                            W = W - W_org
+                            # SVD with rank adaption for subspace: r_eff = r (keep) or r*k
+                            # Use r as is to keep adapter size, but q larger for stability
+                            r = self.peft_config.r
+                            # For subspace we use larger q to capture more info
+                            q = 2 * r + 4 + k * 2
+                            torch.manual_seed(self.settings.seed)
+                            try:
+                                U, S, Vh = torch.svd_lowrank(W, q=q, niter=6)
+                            except Exception:
+                                # fallback
+                                U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
+                            U = U[:, :r]
+                            S = S[:r]
+                            Vh = Vh[:, :r].T
+                            sqrt_S = torch.sqrt(S.clamp(min=1e-12))
+                            lora_B = U @ torch.diag(sqrt_S)
+                            lora_A = torch.diag(sqrt_S) @ Vh
+                        else:
+                            # NONE / PRE: sum contributions directly into lora matrices
+                            # For PRE, scaling by row norms applied after
+                            # Compute combined lora_A/B as sum of outer products?
+                            # We need to produce single lora_A (1, in) and lora_B (out, 1) that represent sum
+                            # But sum of k rank-1 matrices is rank-k, cannot fit into rank-1 adapter
+                            # For NONE/PRE, r=1, so we approximate by summing and then keeping rank-1 via SVD if needed
+                            # Instead, we sum deltas and then do rank-1 SVD approximation
+                            delta = torch.zeros_like(W)
+                            for vi in range(k):
+                                v = layer_vectors[vi].to(module.weight.device)
+                                if v.shape[0] != W.shape[0]:
+                                    continue
+                                lora_A_i = (v @ W).view(1, -1)
+                                lora_B_i = (-weight_per * v).view(-1, 1)
+                                if self.settings.row_normalization == RowNormalization.PRE:
+                                    lora_B_i = W_row_norms * lora_B_i
+                                delta = delta + lora_B_i @ lora_A_i
+                            # For r=1, we need to compress delta to rank-1
+                            # Use SVD to get best rank-1 approximation
+                            if delta.abs().max().item() == 0:
+                                lora_A = torch.zeros(1, W.shape[1], device=W.device, dtype=W.dtype)
+                                lora_B = torch.zeros(W.shape[0], 1, device=W.device, dtype=W.dtype)
+                            else:
+                                # rank 1 SVD
+                                torch.manual_seed(self.settings.seed + vi)
+                                try:
+                                    U, S, Vh = torch.svd_lowrank(delta, q=6, niter=4)
+                                    U = U[:, :1]
+                                    S = S[:1]
+                                    Vh = Vh[:, :1].T
+                                    sqrt_S = torch.sqrt(S.clamp(min=1e-12))
+                                    lora_B = U @ torch.diag(sqrt_S)
+                                    lora_A = torch.diag(sqrt_S) @ Vh
+                                except Exception:
+                                    # fallback: use first vector only
+                                    v0 = layer_vectors[0].to(module.weight.device)
+                                    lora_A = (v0 @ W).view(1, -1)
+                                    lora_B = (-weight * v0).view(-1, 1)
+                                    if self.settings.row_normalization == RowNormalization.PRE:
+                                        lora_B = W_row_norms * lora_B
+                    else:
+                        # Legacy single vector path (original logic)
+                        v = layer_refusal_direction.to(module.weight.device)
+                        lora_A = (v @ W).view(1, -1)
+                        lora_B = (-weight * v).view(-1, 1)
 
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
+                        if self.settings.row_normalization == RowNormalization.PRE:
+                            lora_B = W_row_norms * lora_B
+                        elif self.settings.row_normalization == RowNormalization.FULL:
+                            W = W + lora_B @ lora_A
+                            W = F.normalize(W, p=2, dim=1)
+                            W = W * W_row_norms
+                            W = W - W_org
+                            r = self.peft_config.r
+                            torch.manual_seed(self.settings.seed)
+                            U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
+                            U = U[:, :r]
+                            S = S[:r]
+                            Vh = Vh[:, :r].T
+                            sqrt_S = torch.sqrt(S)
+                            lora_B = U @ torch.diag(sqrt_S)
+                            lora_A = torch.diag(sqrt_S) @ Vh
 
-                    if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
-                        lora_B = W_row_norms * lora_B
-                    elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                        W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
-                        W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
-                        W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
-                        r = self.peft_config.r
-                        # svd_lowrank is randomized:
-                        # https://github.com/pytorch/pytorch/blob/20919052303c0b5ba87f8bf7e19237dc33ab09d3/torch/_lowrank.py#L108-L109
-                        # Reseed immediately before the call so restoring a trial is independent of RNG history.
-                        torch.manual_seed(self.settings.seed)
-                        U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components. Split the singular values
-                        # evenly between the two components to keep their norms balanced and avoid
-                        # potential issues with numerical stability.
-                        sqrt_S = torch.sqrt(S)
-                        lora_B = U @ torch.diag(sqrt_S)
-                        lora_A = torch.diag(sqrt_S) @ Vh
-
-                    # Assign to adapters. The adapter name is "default", because that's
-                    # what PEFT uses when no name is explicitly specified, as above.
-                    # These casts are therefore valid.
                     weight_A = cast(Tensor, module.lora_A["default"].weight)
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
@@ -823,6 +943,46 @@ class Model:
             logprobs.append(self.get_logprobs(batch))
 
         return torch.cat(logprobs, dim=0)
+
+    # We work with raw logits (rather than probabilities) so that scorers can
+    # apply their own normalization; this also avoids precision loss from
+    # double log-softmax operations.
+    def get_logits(self, prompts: list[Prompt]) -> Tensor:
+        # We only generate one token, and we return the raw logits over the
+        # vocabulary at that token position, for each prompt.
+        _, outputs = self.generate(
+            prompts,
+            max_new_tokens=1,
+            output_logits=True,
+            return_dict_in_generate=True,
+            use_cache=False,
+        )
+
+        # This cast is valid because GenerateDecoderOnlyOutput is the return type
+        # of model.generate with return_dict_in_generate=True.
+        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+
+        # Logits for the first (only) generated token.
+        # Use raw logits, not processed generation scores; processors can insert
+        # -inf for suppressed tokens, which can make KL divergence evaluate to NaN.
+        # This cast is valid because we passed output_logits=True above.
+        logits = cast(tuple[FloatTensor], outputs.logits)[0]
+
+        # The returned tensor has shape (prompt, token).
+        if self.settings.offload_outputs_to_cpu:
+            del outputs
+            logits = logits.cpu()
+            empty_cache()
+
+        return logits
+
+    def get_logits_batched(self, prompts: list[Prompt]) -> Tensor:
+        logits = []
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            logits.append(self.get_logits(batch))
+
+        return torch.cat(logits, dim=0)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
         # This cast is valid because str is the return type

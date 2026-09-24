@@ -7,9 +7,8 @@ import json
 import logging
 import os
 import sys
-import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -38,6 +37,25 @@ from .reports import ReportGenerator
 from .utils.runtime import configure_huggingface_environment, free_torch_memory
 
 logger = logging.getLogger(__name__)
+
+# Settings that are local paths or pure runtime diagnostics: they do not
+# affect the produced model, so reproduction takes them from the command line
+# instead of restoring them from the reproduction bundle (which may reference
+# the original machine's paths and would force expensive diagnostics on every
+# reproduction run).
+_REPRODUCTION_LOCAL_ONLY_SETTINGS = frozenset(
+    {
+        "output_dir",
+        "cache_dir",
+        "log_file",
+        "print_residual_geometry",
+        "plot_residuals",
+        "residual_plot_path",
+        "residual_plot_title",
+        "residual_plot_style",
+        "print_debug_information",
+    }
+)
 
 
 @dataclass
@@ -181,23 +199,29 @@ class AbliterationPipeline:
         if self.settings.abliteration_batch_size is None:
             # Preserve 0 (auto) explicitly; original 'or None' lost auto case
             self.settings.abliteration_batch_size = plan.abliteration_batch_size
-        if self.settings.abliteration_max_batch_size is None:
-            self.settings.abliteration_max_batch_size = getattr(plan, "abliteration_max_batch_size", None)
-        # Task 1 human-readable batch log (also already in plan.reasons but explicit)
-        if plan.abliteration_batch_size == 0:
-            logger.info(
-                "Abliteration batch size: auto (max %s) | weights %.1f GB, VRAM %.1f GB",
-                getattr(plan, "abliteration_max_batch_size", 64),
-                plan.estimated_weight_gb,
-                plan.available_vram_gb,
-            )
+            # Task 1 human-readable batch log (also already in plan.reasons but explicit)
+            if plan.abliteration_batch_size == 0:
+                logger.info(
+                    "Abliteration batch size: auto (max %s) | weights %.1f GB, VRAM %.1f GB",
+                    getattr(plan, "abliteration_max_batch_size", 256),
+                    plan.estimated_weight_gb,
+                    plan.available_vram_gb,
+                )
+            else:
+                logger.info(
+                    "Abliteration batch size: %s | weights %.1f GB, VRAM %.1f GB",
+                    plan.abliteration_batch_size,
+                    plan.estimated_weight_gb,
+                    plan.available_vram_gb,
+                )
         else:
             logger.info(
-                "Abliteration batch size: %s | weights %.1f GB, VRAM %.1f GB",
+                "Abliteration batch size: %s (explicit --batch-size override; planner suggested %s)",
+                self.settings.abliteration_batch_size,
                 plan.abliteration_batch_size,
-                plan.estimated_weight_gb,
-                plan.available_vram_gb,
             )
+        if self.settings.abliteration_max_batch_size is None:
+            self.settings.abliteration_max_batch_size = getattr(plan, "abliteration_max_batch_size", None)
 
         logger.info(
             "Load plan: quantization=%s device_map=%s max_memory=%s "
@@ -411,6 +435,10 @@ class AbliterationPipeline:
         logger.info("%s", "=" * 60)
         logger.info("Starting Anlord Abliterator pipeline")
         logger.info("%s", "=" * 60)
+
+        if self.settings.reproduce:
+            return self._run_reproduction_pipeline()
+
         metrics: HardwareMetrics | None = None
 
         try:
@@ -462,6 +490,188 @@ class AbliterationPipeline:
             )
         except Exception as error:
             logger.error("Pipeline failed: %s", error, exc_info=True)
+            if metrics is None:
+                metrics = self.monitor.stop()
+            self.pipeline_result = PipelineResult(
+                success=False,
+                model_id=self.settings.model,
+                baseline=self.baseline_result,
+                abliterated=self.abliterated_result,
+                hardware=metrics,
+                total_duration_seconds=time.time() - self.start_time,
+                start_time=datetime.fromtimestamp(self.start_time).isoformat(),
+                end_time=datetime.now().isoformat(),
+                error=str(error),
+            )
+
+        self._print_summary()
+        return self.pipeline_result
+
+    # ------------------------------------------------------------------
+    # Reproduction mode
+    # ------------------------------------------------------------------
+
+    def _restore_settings_from_reproduction(self, restored_settings) -> None:
+        """Applies restored settings to this run, keeping local paths and
+        command-line display/diagnostic flags."""
+        from .config import Settings
+
+        for field_info in fields(Settings):
+            if field_info.name in _REPRODUCTION_LOCAL_ONLY_SETTINGS:
+                continue
+            setattr(self.settings, field_info.name, getattr(restored_settings, field_info.name))
+        logger.info(
+            "Restored settings from reproduction information "
+            "(model, prompts, scorers, seed, export); display/diagnostic flags "
+            "and local paths are kept from the command line"
+        )
+
+    def _run_reproduction_pipeline(self) -> PipelineResult:
+        """
+        Full reproduction mode: restore the ablation stored in a reproduce.json
+        file, re-apply it to the model, export, and verify the weight file
+        hashes against the original publication.
+        """
+        from .native.config import NativeConfig
+        from .native.reproduce import (
+            check_reproduction_environment,
+            load_reproduction_information,
+            settings_from_reproduction,
+        )
+
+        logger.info("%s", "=" * 60)
+        logger.info("REPRODUCTION MODE: %s", self.settings.reproduce)
+        logger.info("%s", "=" * 60)
+        metrics: HardwareMetrics | None = None
+
+        try:
+            self._check_hardware()
+
+            logger.info("Loading reproduction information from %s", self.settings.reproduce)
+            reproduction_information = load_reproduction_information(self.settings.reproduce)
+            if str(reproduction_information.get("version")) != "3":
+                raise RuntimeError(
+                    "Unsupported reproduction file format version: "
+                    f"{reproduction_information.get('version')}. This version of the pipeline "
+                    "reads version 3 (plugin scorer) reproduce.json files."
+                )
+
+            # Restore the settings recorded with the original run. Local output,
+            # cache and log paths are kept; everything else (model, prompts,
+            # scorers, seed, device, export strategy) comes from the bundle.
+            restored = settings_from_reproduction(reproduction_information["settings"])
+            self._restore_settings_from_reproduction(restored)
+            logger.info("Restored settings for model: %s", self.settings.model)
+
+            native_cfg = NativeConfig.from_anlord_settings(self.settings)
+            if not check_reproduction_environment(native_cfg, reproduction_information):
+                raise RuntimeError(
+                    "Reproduction aborted: environment mismatches were not ignored "
+                    "(ignore_mismatches=False)"
+                )
+
+            self._save_run_config()
+            self._setup_directories()
+
+            # Baseline metrics come from the reproduction information itself —
+            # the original model's scores were recorded when the bundle was created.
+            bundle_metrics = reproduction_information.get("metrics") or {}
+            initial_refusals = int(bundle_metrics.get("initial_refusals") or 0)
+            total_prompts = int(bundle_metrics.get("total_prompts") or 0)
+            self.baseline_result = EvaluationResult(
+                model_id=self.settings.model,
+                evaluation_type="baseline",
+                abliteration=AbliterationResult(
+                    model_id=self.settings.model,
+                    initial_refusals=initial_refusals,
+                    final_refusals=initial_refusals,
+                    total_prompts=total_prompts,
+                    initial_refusal_rate=(
+                        initial_refusals / total_prompts if total_prompts else 0.0
+                    ),
+                    final_refusal_rate=(
+                        initial_refusals / total_prompts if total_prompts else 0.0
+                    ),
+                    trials=int(bundle_metrics.get("trials") or 0),
+                    best_trial=int(bundle_metrics.get("best_trial") or 0),
+                    config={"source": "reproduction_information"},
+                ),
+                timestamp=str(reproduction_information.get("timestamp") or ""),
+                config={"source": "reproduction_information"},
+            )
+
+            self.monitor.start()
+
+            # Reproduction: restore parameters, re-apply the ablation, export,
+            # and verify the weight file hashes.
+            use_native = NativeAbliterator is not None
+            if not use_native:
+                raise RuntimeError("Native abliteration backend is unavailable")
+            logger.info("Restoring ablation from reproduction information")
+            abliter = NativeAbliterator(native_cfg, anlord_settings=self.settings)
+            native_out = self.settings.get_models_dir() / "abliterated"
+            native_out.mkdir(parents=True, exist_ok=True)
+            native_result = abliter.run_reproduction(native_out, reproduction_information)
+
+            self.abliteration_result = AbliterationResult(
+                model_id=native_result.model_id,
+                abliterated_model_path=native_result.abliterated_model_path,
+                initial_refusals=native_result.initial_refusals,
+                final_refusals=native_result.final_refusals,
+                total_prompts=native_result.total_prompts,
+                initial_refusal_rate=(
+                    native_result.initial_refusals / native_result.total_prompts
+                    if native_result.total_prompts
+                    else 0
+                ),
+                final_refusal_rate=(
+                    native_result.final_refusals / native_result.total_prompts
+                    if native_result.total_prompts
+                    else 0
+                ),
+                kl_divergence=native_result.kl_divergence,
+                trials=native_result.trials,
+                best_trial=native_result.best_trial,
+                config=native_result.config,
+            )
+            self._write_json(
+                self.settings.get_results_dir() / "abliteration.json",
+                self.abliteration_result.to_dict(),
+            )
+            if native_result.hash_verification is not None:
+                self._write_json(
+                    self.settings.get_results_dir() / "reproduction_hashes.json",
+                    native_result.hash_verification,
+                )
+            self._synthesize_baseline_from_abliteration()
+
+            self._run_abliterated_evaluation()
+            comparison = self._run_comparison()
+
+            metrics = self.monitor.stop()
+            comparison.peak_vram_gb = metrics.peak_vram_gb
+            comparison.peak_ram_gb = metrics.peak_ram_gb
+            comparison.total_duration_seconds = time.time() - self.start_time
+            self._write_json(
+                self.settings.get_results_dir() / "comparison.json",
+                comparison.to_dict(),
+            )
+            report_paths = self._generate_reports(comparison)
+
+            self.pipeline_result = PipelineResult(
+                success=True,
+                model_id=self.settings.model,
+                baseline=self.baseline_result,
+                abliterated=self.abliterated_result,
+                comparison=comparison,
+                hardware=metrics,
+                report_paths=report_paths,
+                total_duration_seconds=time.time() - self.start_time,
+                start_time=datetime.fromtimestamp(self.start_time).isoformat(),
+                end_time=datetime.now().isoformat(),
+            )
+        except Exception as error:
+            logger.error("Reproduction pipeline failed: %s", error, exc_info=True)
             if metrics is None:
                 metrics = self.monitor.stop()
             self.pipeline_result = PipelineResult(
@@ -803,7 +1013,7 @@ class AbliterationPipeline:
                     native_cfg.full_normalization_lora_rank = int(getattr(self.settings, "full_normalization_lora_rank", 3))
                 except Exception as e:
                     logger.debug("Native config override failed: %s", e)
-                abliter = NativeAbliterator(native_cfg)  # type: ignore
+                abliter = NativeAbliterator(native_cfg, anlord_settings=self.settings)  # type: ignore
                 # output dir: models/abliteration_output equivalent but native
                 native_out = self.settings.get_models_dir() / "abliterated"
                 native_out.mkdir(parents=True, exist_ok=True)
@@ -937,7 +1147,7 @@ class AbliterationPipeline:
         if self.baseline_result is None or self.abliterated_result is None:
             raise RuntimeError("Both baseline and abliterated evaluations are required")
 
-        if not self.settings.skip_benchmarks:
+        if not self.settings.skip_benchmarks and not self.settings.reproduce:
             missing_baseline = set(self.settings.benchmarks) - set(self.baseline_result.benchmarks)
             missing_abliterated = set(self.settings.benchmarks) - set(
                 self.abliterated_result.benchmarks
