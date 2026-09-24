@@ -30,7 +30,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Anlord Abliterator Development Team",
     author_email="anlord@example.com",
-    url="https://github.com/anlord-project/anlord",
+    url="https://github.com/justbedwarsplay/AnlordAbliterator",
     license="AGPL-3.0",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
