@@ -31,6 +31,13 @@ class Settings(BaseModel):
         description="Task metric to use as the benchmark score.",
     )
 
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional cap on evaluated samples. Full benchmark tasks take far too "
+        "long per optimization trial — set e.g. 50-200 to keep the search fast. None = full task.",
+    )
+
 
 class BenchmarkScore(Scorer):
     """
@@ -65,6 +72,7 @@ class BenchmarkScore(Scorer):
         results = lm_eval.simple_evaluate(
             model=self.hflm,
             tasks=[self.settings.task],
+            limit=self.settings.limit,
         )
 
         benchmark_score = float(

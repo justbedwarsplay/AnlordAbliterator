@@ -1,6 +1,6 @@
 [project]
 name = "AnlordAbliterator"
-version = "1.2.0.post1"
+version = "1.3.0"
 description = "Anlord Abliterator — automated LLM abliteration and evaluation"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
@@ -9,7 +9,6 @@ authors = [
 ]
 requires-python = ">=3.10"
 keywords = ["llm", "abliteration", "benchmark", "evaluation"]
-
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -66,13 +65,9 @@ research = [
     "matplotlib>=3.8",
 ]
 
-[project.urls]
-Homepage = "https://github.com/justbedwarsplay/AnlordAbliterator"
-Repository = "https://github.com/justbedwarsplay/AnlordAbliterator"
-Issues = "https://github.com/justbedwarsplay/AnlordAbliterator/issues"
-
 [project.scripts]
-AnlordAbliterator = "anlord.cli.main:main"
+anlord = "anlord.cli.main:main"
+anlordabliterator = "anlord.cli.main:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]

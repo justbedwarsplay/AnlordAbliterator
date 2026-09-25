@@ -19,6 +19,7 @@ from .benchmarks.native import NativeBenchmarkRunner
 from .benchmarks.runner import BenchmarkRunner
 from .config import ExportFormat, Settings
 from .evaluation import BaselineEvaluator, ComparisonResult, EvaluationResult, compare_results
+from .evaluation.comparison import format_optional
 from .hardware import HardwareMetrics, HardwareMonitor, get_system_info
 from .hardware.planner import describe_pagefile_fix, plan_model_load
 from .evaluation.evaluator import AbliterationResult
@@ -576,8 +577,10 @@ class AbliterationPipeline:
             # Baseline metrics come from the reproduction information itself —
             # the original model's scores were recorded when the bundle was created.
             bundle_metrics = reproduction_information.get("metrics") or {}
-            initial_refusals = int(bundle_metrics.get("initial_refusals") or 0)
-            total_prompts = int(bundle_metrics.get("total_prompts") or 0)
+            initial_refusals = bundle_metrics.get("initial_refusals")
+            initial_refusals = int(initial_refusals) if initial_refusals is not None else None
+            total_prompts = bundle_metrics.get("total_prompts")
+            total_prompts = int(total_prompts) if total_prompts is not None else None
             self.baseline_result = EvaluationResult(
                 model_id=self.settings.model,
                 evaluation_type="baseline",
@@ -587,10 +590,14 @@ class AbliterationPipeline:
                     final_refusals=initial_refusals,
                     total_prompts=total_prompts,
                     initial_refusal_rate=(
-                        initial_refusals / total_prompts if total_prompts else 0.0
+                        initial_refusals / total_prompts
+                        if total_prompts and initial_refusals is not None
+                        else None
                     ),
                     final_refusal_rate=(
-                        initial_refusals / total_prompts if total_prompts else 0.0
+                        initial_refusals / total_prompts
+                        if total_prompts and initial_refusals is not None
+                        else None
                     ),
                     trials=int(bundle_metrics.get("trials") or 0),
                     best_trial=int(bundle_metrics.get("best_trial") or 0),
@@ -621,13 +628,13 @@ class AbliterationPipeline:
                 total_prompts=native_result.total_prompts,
                 initial_refusal_rate=(
                     native_result.initial_refusals / native_result.total_prompts
-                    if native_result.total_prompts
-                    else 0
+                    if native_result.total_prompts and native_result.initial_refusals is not None
+                    else None
                 ),
                 final_refusal_rate=(
                     native_result.final_refusals / native_result.total_prompts
-                    if native_result.total_prompts
-                    else 0
+                    if native_result.total_prompts and native_result.final_refusals is not None
+                    else None
                 ),
                 kl_divergence=native_result.kl_divergence,
                 trials=native_result.trials,
@@ -714,17 +721,17 @@ class AbliterationPipeline:
             return None
         if data.get("initial_refusals") is None and data.get("total_prompts") is None:
             return None
-        total_prompts = int(data.get("total_prompts") or 0)
-        initial_refusals = int(data.get("initial_refusals") or 0)
-        final_refusals = int(data.get("final_refusals") or initial_refusals)
+        total_prompts = data.get("total_prompts")
+        initial_refusals = data.get("initial_refusals")
+        final_refusals = data.get("final_refusals", initial_refusals)
         logger.info("Loaded Abliteration metrics from %s", path)
         return AbliterationResult(
             model_id=model_id,
             initial_refusals=initial_refusals,
             final_refusals=final_refusals,
             total_prompts=total_prompts,
-            initial_refusal_rate=(initial_refusals / total_prompts if total_prompts else 0.0),
-            final_refusal_rate=(final_refusals / total_prompts if total_prompts else 0.0),
+            initial_refusal_rate=(initial_refusals / total_prompts if total_prompts else None),
+            final_refusal_rate=(final_refusals / total_prompts if total_prompts else None),
             kl_divergence=float(data.get("kl_divergence") or 0.0),
             evaluation_time_seconds=float(data.get("evaluation_time") or 0.0),
         )
@@ -957,10 +964,10 @@ class AbliterationPipeline:
             self.baseline_result.to_dict(),
         )
         logger.info(
-            "Synthesized baseline Abliteration metrics from abliteration: refusals %s/%s, KL %.4f",
-            hr.initial_refusals,
-            hr.total_prompts,
-            hr.kl_divergence,
+            "Synthesized baseline Abliteration metrics from abliteration: refusals %s/%s, KL %s",
+            format_optional(hr.initial_refusals),
+            format_optional(hr.total_prompts),
+            format_optional(hr.kl_divergence, "{:.4f}"),
         )
 
     def _run_or_load_abliteration(self) -> None:
@@ -1025,7 +1032,11 @@ class AbliterationPipeline:
                     initial_refusals=native_result.initial_refusals,
                     final_refusals=native_result.final_refusals,
                     total_prompts=native_result.total_prompts,
-                    initial_refusal_rate=(native_result.initial_refusals / native_result.total_prompts if native_result.total_prompts else 0),
+                    initial_refusal_rate=(
+                        native_result.initial_refusals / native_result.total_prompts
+                        if native_result.total_prompts and native_result.initial_refusals is not None
+                        else None
+                    ),
                     final_refusal_rate=(native_result.final_refusals / native_result.total_prompts if native_result.total_prompts else 0),
                     kl_divergence=native_result.kl_divergence,
                     trials=native_result.trials,
@@ -1036,19 +1047,18 @@ class AbliterationPipeline:
                 self.abliteration_result = result
                 self._write_json(self.settings.get_results_dir() / "abliteration.json", result.to_dict())
                 logger.info(
-                    "Native abliteration completed: refusals %s -> %s; KL divergence %.4f",
-                    result.initial_refusals,
-                    result.final_refusals,
-                    result.kl_divergence,
+                    "Native abliteration completed: refusals %s -> %s; KL divergence %s",
+                    format_optional(result.initial_refusals),
+                    format_optional(result.final_refusals),
+                    format_optional(result.kl_divergence, "{:.4f}"),
                 )
                 self._synthesize_baseline_from_abliteration()
                 return
             except Exception as native_err:
                 logger.error("Native abliteration failed: %s", native_err, exc_info=True)
-                if backend == "native":
-                    raise RuntimeError(f"Native abliteration failed: {native_err}") from native_err
-                logger.warning("Falling back to Abliteration backend (native failed)")
-                raise RuntimeError(f"Native abliteration failed and no fallback available: {native_err}") from native_err
+                # "auto" resolves to the native backend above, so both backend
+                # values end here: there is no second backend to fall back to.
+                raise RuntimeError(f"Native abliteration failed: {native_err}") from native_err
 
         raise RuntimeError("Native abliteration is unavailable and no fallback is configured")
 
@@ -1195,9 +1205,9 @@ class AbliterationPipeline:
         if result.comparison:
             comparison = result.comparison
             print("\nAbliteration:")
-            print(f"  Initial refusals: {comparison.final_refusals_baseline}")
-            print(f"  Final refusals:   {comparison.final_refusals_abliterated}")
-            print(f"  KL divergence:    {comparison.kl_divergence:.4f}")
+            print(f"  Initial refusals: {format_optional(comparison.final_refusals_baseline)}")
+            print(f"  Final refusals:   {format_optional(comparison.final_refusals_abliterated)}")
+            print(f"  KL divergence:    {format_optional(comparison.kl_divergence, '{:.4f}')}")
             if comparison.benchmarks:
                 print("\nBenchmarks:")
                 for metrics in sorted(

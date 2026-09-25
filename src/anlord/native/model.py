@@ -523,7 +523,6 @@ class Model:
     ):
         # Subspace support: refusal_directions may be [layers, hidden] (legacy) or [layers, k, hidden] (subspace)
         is_subspace = refusal_directions.dim() == 3
-        subspace_k = refusal_directions.shape[1] if is_subspace else 1
 
         if is_subspace:
             # For subspace, handle direction_index by interpolating each of k vectors between layers

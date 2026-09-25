@@ -41,6 +41,8 @@
 | **📊 Native runner (default)** | Custom evaluators on `datasets` + `transformers` — no `lm-eval` required, works offline, tolerant to `trust_remote_code` deprecation |
 | **🧪 Extended suite** | **29 tasks / 17 families** — 6 classic + GPQA, MMLU-Pro, Ifstruct, ParseBench, ExtractBench, ScreenSpot-Pro, MMMU-Pro. All selectable via `--tasks` or checkbox |
 | **⚖️ Before → After** | Same benchmarks run on baseline and abliterated models, `comparison.json` with deltas |
+| **⚡ Search acceleration** | Multi-fidelity pruning of dominated trials (cheap KL first, refusal prefixes next), seed trials for fresh studies, 20 startup trials, 64-token refusal counting — a 200-trial run fits in ~1.5 h on an 8 GB GPU |
+| **🧪 Behavioral reproduction check** | `--reproduce` re-measures refusals and KL on the reproduced model and prints MATCH/MISMATCH against the original run |
 | **💻 Hardware-aware** | `psutil` + `pynvml` monitoring. `HardwarePlanner` auto-selects load-time `quantization` / `device_map` / `max_memory` / `batch_size` for your GPU (see note below) |
 | **📝 Reports** | Interactive `report.html` + `report.json` + `report.csv` + per-benchmark `*.json` |
 | **🔄 Resume** | `--resume` (on by default) — skips completed abliteration + benchmark shards by `model_id + config` hash. Corrupted `*.tmp` files are ignored |
@@ -229,6 +231,14 @@ Export / reproduction:
   --ignore-mismatches    reproduce despite environment differences (default: warn)
   --print-debug-information
 
+Search acceleration:
+  --startup-trials       random-sampling TPE startup (default: automatic, ~min(20, n/8))
+  --max-response-length  refusal-counting generation cap (default 64)
+  --max-weight-limit     max_weight ceiling (default 1.5; raise to 2.0+ for attention-only)
+  --direction-source     mean | median (robust to massive activations)
+  --pruning / --no-pruning       early abandonment of dominated trials (default on)
+  --search-seeds / --no-search-seeds   seed configs for fresh studies (default on)
+
 Benchmarks:
   --tasks, --benchmarks, -b   see table above
   --mode                 quick | full
@@ -320,6 +330,8 @@ AnlordAbliterator --reproduce username/model-name
 
 The pipeline restores the original settings and parameters, re-applies the ablation, exports
 the model and checks the SHA-256 hashes of the weight files (`reproduction_hashes.json`).
+It then re-measures every recorded scorer on the reproduced model (refusals, KL, ...) and
+prints MATCH/MISMATCH against the original run's numbers.
 Environment differences are reported in a table; `--ignore-mismatches` proceeds anyway.
 
 ## Scorer plugins
@@ -344,7 +356,9 @@ Add your own via the `--scorers` JSON (or the `scorers` / `scorer_settings` sett
 ```
 
 Built-in plugins live under the `anlord.scorers.*` namespace; external ones are referenced as
-`path/to/plugin.py:ClassName` or `module.submodule.ClassName`. Only runs whose model and
+`path/to/plugin.py:ClassName` or `module.submodule.ClassName`. `BenchmarkScore` accepts a
+`limit` (samples per evaluation) so a real benchmark can act as an optimization objective
+without running the full task on every trial. Only runs whose model and
 datasets are pinned Hugging Face paths and whose scorers are all reproducible built-ins get a
 reproduction bundle.
 

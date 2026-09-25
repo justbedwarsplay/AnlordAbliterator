@@ -88,6 +88,11 @@ class KeywordRate(Scorer):
 
     settings: Settings
 
+    # Class-level defaults so the scorer is detectable before its first
+    # get_score() call (used by the evaluator's quick-evaluation methods).
+    last_match_count: int = 0
+    last_total: int = 0
+
     @property
     def reproducible(self) -> bool:
         return True
@@ -95,6 +100,11 @@ class KeywordRate(Scorer):
     @property
     def score_name(self) -> str:
         return self.settings.score_name
+
+    def count_matches(self, responses: list) -> int:
+        """Counts keyword matches over ready responses (shared by the full and
+        the multi-fidelity prefix evaluation paths)."""
+        return sum(1 for response in responses if self._is_match(response))
 
     def init(self, ctx: Context) -> None:
         print()

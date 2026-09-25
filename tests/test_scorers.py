@@ -67,11 +67,12 @@ def _make_config(model_path: Path, tmp_path: Path, scorer_settings: dict | None 
 
 
 @pytest.fixture(scope="module")
-def evaluator(tmp_path_factory):
+def evaluator():
     from anlord.native.evaluator import Evaluator
     from anlord.native.model import Model
 
-    tmp_path = tmp_path_factory.mktemp("scorer_prompts")
+    tmp_path = Path(__file__).parent / "_scorer_tmp"
+    tmp_path.mkdir(exist_ok=True)
     cfg = _make_config(TINY_MODEL, tmp_path)
     cfg.response_prefix = ""
     model = Model(cfg)

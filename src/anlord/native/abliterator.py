@@ -77,21 +77,85 @@ _DISPLAY_ONLY_NATIVE_FIELDS = frozenset(
 )
 
 
+def max_weight_bounds(component: str, max_weight_limit: float) -> tuple[float, float]:
+    """
+    Search bounds for a component's max_weight.
+
+    Lower: the MLP can be fully disabled (negative bound clamped to 0 in the
+    objective), attention has a floor of 0.8. Upper: the configurable limit,
+    kept strictly above the lower bound.
+    """
+    lower = -0.25 if component == "mlp.down_proj" else 0.8
+    upper = max(float(max_weight_limit), lower + 0.05)
+    return lower, upper
+
+
+def evaluator_refusals_available(config: NativeConfig) -> bool:
+    """
+    True when a keyword-rate-like scorer is configured, i.e. integer refusal
+    counts are measurable. Decides n/a vs real-number reporting.
+    """
+    for scorer_config in config.scorers:
+        plugin = scorer_config.plugin
+        if plugin.startswith("anlord.") and plugin.rsplit(".", 1)[-1] == "KeywordRate":
+            return True
+    return False
+
+
+def _completed_metric_points(study) -> list[tuple[int, float]]:
+    """(refusal count, KL) pairs of all completed trials, for the dominance
+    checks of the multi-fidelity pruning."""
+    points: list[tuple[int, float]] = []
+    for trial in study.trials:
+        if trial.state != TrialState.COMPLETE:
+            continue
+        refusals = trial.user_attrs.get("refusals")
+        kl = trial.user_attrs.get("kl_divergence")
+        if refusals is None or kl is None:
+            continue
+        points.append((int(refusals), float(kl)))
+    return points
+
+
+def _pruning_schedule(
+    total_prompts: int, batch_size: int, fractions: list[float]
+) -> list[int]:
+    """
+    Prefix lengths for the progressive refusal evaluation.
+
+    Steps are rounded up to the generation batch grid so the prefix counts are
+    produced by exactly the same batch composition as the full evaluation (and
+    are therefore exact lower bounds of the full refusal count). Steps that
+    round up to the full evaluation are dropped.
+    """
+    steps: list[int] = []
+    if total_prompts <= 0 or not fractions or batch_size is None or batch_size <= 0:
+        return steps
+    for fraction in fractions:
+        k = max(1, math.ceil(total_prompts * float(fraction)))
+        k = math.ceil(k / batch_size) * batch_size
+        k = min(k, total_prompts)
+        if 0 < k < total_prompts and k not in steps:
+            steps.append(k)
+    return sorted(steps)
+
+
 class NativeAbliteratorResult:
     def __init__(
         self,
         model_id: str,
         abliterated_model_path: Optional[str] = None,
-        initial_refusals: int = 0,
-        final_refusals: int = 0,
-        total_prompts: int = 0,
-        kl_divergence: float = 0.0,
+        initial_refusals: Optional[int] = None,
+        final_refusals: Optional[int] = None,
+        total_prompts: Optional[int] = None,
+        kl_divergence: Optional[float] = None,
         trials: int = 0,
         best_trial: int = 0,
         config: dict | None = None,
         error: Optional[str] = None,
         hash_verification: Optional[dict[str, str]] = None,
         reproduction_mode: bool = False,
+        score_verification: Optional[dict] = None,
     ):
         self.model_id = model_id
         self.abliterated_model_path = abliterated_model_path
@@ -105,6 +169,7 @@ class NativeAbliteratorResult:
         self.error = error
         self.hash_verification = hash_verification
         self.reproduction_mode = reproduction_mode
+        self.score_verification = score_verification
 
     def to_dict(self) -> dict:
         data = {
@@ -123,6 +188,8 @@ class NativeAbliteratorResult:
             data["hash_verification"] = self.hash_verification
         if self.reproduction_mode:
             data["reproduction_mode"] = True
+        if self.score_verification is not None:
+            data["score_verification"] = self.score_verification
         return data
 
 
@@ -436,6 +503,58 @@ class NativeAbliterator:
         return correct / len(proxy) if proxy else 0.0
 
 
+    def _enqueue_seed_trials(self, study, model: Model) -> None:
+        """
+        Enqueues a few sensible starting configurations for a fresh study.
+
+        The seeds span the region where optima are typically found (mid-to-late
+        layers, moderate window, near-zero min weight), so the Pareto front
+        forms immediately and TPE starts from informative observations instead
+        of pure random exploration. Unrequested parameters (e.g. components
+        excluded by the include list) are sampled normally.
+        """
+        last_layer_index = len(model.get_layers()) - 1
+        components = model.get_abliterable_components()
+        limit = float(getattr(self.config, "max_weight_limit", 1.5) or 1.5)
+
+        def component_params(max_weight: float, pos: float, min_frac: float, dist: float):
+            params = {}
+            for component in components:
+                params[f"{component}.max_weight"] = min(max_weight, limit)
+                params[f"{component}.max_weight_position"] = min(
+                    max(pos, 0.6 * last_layer_index), 1.0 * last_layer_index
+                )
+                params[f"{component}.min_weight"] = min_frac
+                params[f"{component}.min_weight_distance"] = min(
+                    max(dist, 1.0), max(0.6 * last_layer_index, 1.0)
+                )
+            return params
+
+        seeds = [
+            {
+                "direction_scope": "global",
+                "direction_index": 0.75 * last_layer_index,
+                **component_params(1.0, 0.75 * last_layer_index, 0.05, 0.3 * last_layer_index),
+            },
+            {
+                "direction_scope": "global",
+                "direction_index": 0.8 * last_layer_index,
+                **component_params(1.3, 0.8 * last_layer_index, 0.0, 0.45 * last_layer_index),
+            },
+            {
+                "direction_scope": "per layer",
+                **component_params(1.1, 0.7 * last_layer_index, 0.0, 0.5 * last_layer_index),
+            },
+        ]
+
+        print(f"* Enqueueing {len(seeds)} seed trials for the fresh study")
+        for seed in seeds[: self.config.n_trials]:
+            try:
+                study.enqueue_trial(seed, skip_if_exists=True)
+            except Exception as e:
+                print(f"[yellow]Could not enqueue seed trial: {e}[/]")
+                break
+
     def _compute_refusal_directions(
         self,
         model: Model,
@@ -508,8 +627,16 @@ class NativeAbliterator:
                 if self.config.plot_residuals:
                     analyzer.plot_residuals()
 
-            good_means = good_residuals.mean(dim=0)
-            bad_means = bad_residuals.mean(dim=0)
+            # The direction source is run-identity (recorded in reproduction
+            # bundles): "median" uses the per-component median of the residual
+            # vectors, which is robust to massive activations.
+            if getattr(self.config, "direction_source", "mean") == "median":
+                print("* Using per-component median residuals for the refusal direction")
+                good_means = good_residuals.median(dim=0).values
+                bad_means = bad_residuals.median(dim=0).values
+            else:
+                good_means = good_residuals.mean(dim=0)
+                bad_means = bad_residuals.mean(dim=0)
             # The full residuals are no longer needed after the analysis
             # and the means have been computed.
             del good_residuals, bad_residuals
@@ -646,21 +773,11 @@ class NativeAbliterator:
         except IndexError:
             existing = None
 
-        # If resuming, Abliteration reloads settings from study. We do the same for parity
-        # but also keep Anlord-specific fields (model, cache). Simplified: if study
-        # exists and not finished, we reuse its settings json but preserve n_trials.
-        # For native we always allow resume; if study finished, we will reuse it.
-        # This matches Anlord's AbliterationWrapper which handles resume via study file.
-        if existing is not None:
-            # Check finished flag
-            try:
-                finished = existing.user_attrs.get("finished", False)
-            except Exception:
-                finished = False
-            # If settings stored, we could load them, but for native we keep current config
-            # to honor Anlord's model/cache overrides. This is intentional divergence
-            # documented in docs/abliteration_implementation.md
-            pass
+        if existing is not None and existing.user_attrs.get("finished"):
+            print(
+                "* A previous run of this model is finished; continuing will add "
+                "more trials on top of it."
+            )
 
         # Model loading
         model = Model(self.config)
@@ -681,6 +798,12 @@ class NativeAbliterator:
         # Evaluator — loads and initializes all configured scorers, then
         # computes baseline scores (including refusal counts and KL).
         evaluator = Evaluator(self.config, model)
+        has_refusal_metrics = evaluator.refusal_prompt_total() > 0
+        if evaluator.refusal_prompt_total() == 0:
+            print(
+                "[yellow]No keyword-rate scorer configured: refusal counts in results, "
+                "comparisons and reports will be recorded as 0 (unknown).[/]"
+            )
 
         # Capability proxy (feature 2): tiny MMLU to preserve capability
         capability_proxy = None
@@ -690,7 +813,6 @@ class NativeAbliterator:
                 print(f"* Capability proxy: {self.config.capability_proxy_dataset}/{self.config.capability_proxy_subset} ({len(capability_proxy)} samples)")
                 base_cap = self._score_capability(model, capability_proxy)
                 print(f"* Base capability (proxy MMLU): {base_cap:.3f}")
-                evaluator.base_capability = base_cap  # type: ignore
             except Exception as e:
                 print(f"[yellow]Capability proxy init failed ({e}), disabling[/]")
                 capability_proxy = None
@@ -728,6 +850,47 @@ class NativeAbliterator:
             study_name="abliteration",
             load_if_exists=True,
         )
+        # An existing journal silently keeps its original directions (verified
+        # on Optuna 4.x), so a scorer configuration change would surface as a
+        # cryptic failure mid-run. Detect it and explain the way out.
+        if [d.name for d in study.directions] != [d.name for d in study_directions]:
+            raise RuntimeError(
+                "The study journal "
+                f"{study_file} was created with different optimization objectives "
+                f"({', '.join(d.name for d in study.directions)}) than the current "
+                f"configuration ({', '.join(d.name for d in study_directions)}). "
+                "Delete the journal file to start a fresh study, or restore the "
+                "previous scorer configuration to continue it."
+            )
+
+        # Multi-fidelity pruning setup. Disabled with the capability proxy:
+        # the front is then three-dimensional and the capability of a trial is
+        # unknown until its full evaluation, so no sound dominance test exists.
+        pruning_active = bool(
+            self.config.evaluation_pruning
+            and not (getattr(self.config, "capability_proxy_enabled", False) and capability_proxy is not None)
+            and self.config.batch_size
+            and self.config.batch_size > 0
+        )
+        pruning_schedule: list[int] = []
+        if pruning_active:
+            refusal_total = evaluator.refusal_prompt_total()
+            pruning_schedule = _pruning_schedule(
+                refusal_total, self.config.batch_size, list(self.config.pruning_fractions)
+            )
+            if not pruning_schedule:
+                pruning_active = False
+            else:
+                print(
+                    f"* Early pruning of dominated trials active: refusal prefixes "
+                    f"{pruning_schedule} of {refusal_total} prompts"
+                )
+
+        # Seed trials: a fresh study starts from a few sensible configurations
+        # instead of spending its startup trials on pure random exploration.
+        if self.config.search_seeds and len(study.trials) == 0:
+            self._enqueue_seed_trials(study, model)
+
         # persist settings json for resume parity
         try:
             # NativeConfig -> dict -> json
@@ -738,16 +901,20 @@ class NativeAbliterator:
         except Exception:
             pass
 
-        start_index = len(study.trials)
+        start_index = len(
+            [t for t in study.trials if t.state != TrialState.WAITING]
+        )
         trial_index = start_index
         start_time = time.perf_counter()
+        last_trial_end = start_time
+        trial_durations: list[float] = []
         if start_index > 0:
             print()
             print("Resuming existing study.")
 
         # Objective — scorers provide the scores; capability proxy may add one more
         def objective(trial: Trial) -> tuple[float, ...]:
-            nonlocal trial_index
+            nonlocal trial_index, last_trial_end
             trial_index += 1
             trial.set_user_attr("index", trial_index)
 
@@ -771,9 +938,13 @@ class NativeAbliterator:
                 # intelligence more than ablating the attention output, so on many
                 # models the optimum is to leave it (mostly) untouched.
                 max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
+                # The upper bound is configurable: attention-only runs benefit
+                # from a higher limit because attention has to carry the whole
+                # ablation by itself (see docs/optimization_ideas.md).
+                max_weight_upper = max_weight_bounds(component, self.config.max_weight_limit)[1]
                 max_weight = max(
                     0.0,
-                    trial.suggest_float(f"{component}.max_weight", max_weight_lower_bound, 1.5),
+                    trial.suggest_float(f"{component}.max_weight", max_weight_lower_bound, max_weight_upper),
                 )
                 max_weight_position = trial.suggest_float(f"{component}.max_weight_position", 0.6 * last_layer_index, 1.0 * last_layer_index)
                 min_weight = trial.suggest_float(f"{component}.min_weight", 0.0, 1.0)
@@ -802,13 +973,71 @@ class NativeAbliterator:
             print("* Abliterating...")
             model.abliterate(refusal_directions, direction_index, parameters)
             print("* Evaluating...")
+
+            # Multi-fidelity early abandonment: a trial that is already
+            # provably dominated by some completed trial never reaches the
+            # Pareto front, so it is pruned before paying for the expensive
+            # refusal generation. See docs/optimization_ideas.md for the
+            # soundness argument (prefix counts are exact lower bounds).
+            if pruning_active and trial_index > self.config.n_startup_trials:
+                front_points = _completed_metric_points(study)
+                if front_points:
+                    kl_value = evaluator.quick_kl_divergence()
+                    if kl_value is not None:
+                        zero_refusal_kls = [
+                            kl for refusals, kl in front_points if refusals <= 0
+                        ]
+                        if zero_refusal_kls and kl_value >= min(zero_refusal_kls):
+                            print(
+                                f"  * [yellow]Pruned after KL step: KL {kl_value:.4f} is above the "
+                                f"zero-refusal front point ({min(zero_refusal_kls):.4f})[/]"
+                            )
+                            raise TrialPruned()
+                        total = evaluator.refusal_prompt_total()
+                        for step_index, k in enumerate(pruning_schedule):
+                            r_k = evaluator.quick_refusals(k)
+                            if r_k is None:
+                                break
+                            # Record the prefix count as an intermediate value so
+                            # TPE can rank pruned trials meaningfully. Trial.report
+                            # refuses multi-objective studies, but the underlying
+                            # storage API (used by _get_pruned_trial_score) does not
+                            # care about the study dimensionality; fall back
+                            # silently if that ever changes.
+                            try:
+                                study._storage.set_trial_intermediate_value(
+                                    trial._trial_id, step_index, float(r_k)
+                                )
+                            except Exception:
+                                pass
+                            dominating = [
+                                (refusals, kl)
+                                for refusals, kl in front_points
+                                if refusals <= r_k and kl <= kl_value
+                            ]
+                            if dominating:
+                                refusals_f, kl_f = dominating[0]
+                                print(
+                                    f"  * [yellow]Pruned after {k}/{total} prompts: "
+                                    f"refusals >= {r_k} with KL {kl_value:.4f} is dominated by "
+                                    f"(refusals {refusals_f}, KL {kl_f:.4f})[/]"
+                                )
+                                trial.set_user_attr("pruned_at", k)
+                                raise TrialPruned()
+
             scores = evaluator.get_scores()
             objective_values = list(evaluator.get_objective_values(scores))
             for name, score in scores:
                 print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
 
             elapsed = time.perf_counter() - start_time
-            remaining = (elapsed / (trial_index - start_index)) * (self.config.n_trials - trial_index) if (trial_index - start_index) > 0 else 0
+            # Rolling-window ETA: the last 20 trials decide the projection, so
+            # the estimate adapts when the per-trial speed changes mid-run
+            # (e.g. GPU throttling ending, batch-size effects).
+            trial_durations.append(elapsed - last_trial_end)
+            last_trial_end = elapsed
+            recent = trial_durations[-20:]
+            remaining = (sum(recent) / len(recent)) * (self.config.n_trials - trial_index) if (trial_index - start_index) > 0 else 0
             print()
             print(f"[grey50]Elapsed time: [bold]{format_duration(elapsed)}[/][/]")
             if trial_index < self.config.n_trials:
@@ -828,13 +1057,19 @@ class NativeAbliterator:
 
             trial.set_user_attr("scores", evaluator.get_paired_score_records(scores))
 
-            # Legacy metric attributes (plain refusals/KL) for pipeline compatibility.
-            kl_divergence = evaluator.last_kl_divergence if evaluator.last_kl_divergence is not None else 0.0
-            refusals = evaluator.last_refusals if evaluator.last_refusals is not None else 0
-            trial.set_user_attr("kl_divergence", kl_divergence)
-            trial.set_user_attr("refusals", refusals)
-            trial.set_user_attr("base_refusals", evaluator.base_refusals)
-            trial.set_user_attr("n_bad_prompts", len(evaluator.bad_prompts))
+            # Legacy metric attributes (plain refusals/KL) for pipeline
+            # compatibility. None means "not measured" (no matching scorer);
+            # dominance-pruning front points skip such trials.
+            trial.set_user_attr("kl_divergence", evaluator.last_kl_divergence)
+            trial.set_user_attr("refusals", evaluator.last_refusals)
+            trial.set_user_attr(
+                "base_refusals",
+                evaluator.base_refusals if evaluator.refusal_prompt_total() > 0 else None,
+            )
+            trial.set_user_attr(
+                "n_bad_prompts",
+                len(evaluator.bad_prompts) if evaluator.refusal_prompt_total() > 0 else None,
+            )
 
             return tuple(objective_values)
 
@@ -845,7 +1080,12 @@ class NativeAbliterator:
                 trial.study.stop()
                 raise TrialPruned()
 
-        n_needed = self.config.n_trials - len(study.trials)
+        # Waiting (enqueued seed) trials are not yet executed: count only the
+        # actually run trials against the requested n_trials.
+        executed_before = len(
+            [t for t in study.trials if t.state != TrialState.WAITING]
+        )
+        n_needed = self.config.n_trials - executed_before
         if n_needed > 0:
             # timeout handling
             try:
@@ -853,7 +1093,10 @@ class NativeAbliterator:
             except KeyboardInterrupt:
                 pass
 
-        if len(study.trials) == self.config.n_trials:
+        executed_after = len(
+            [t for t in study.trials if t.state != TrialState.WAITING]
+        )
+        if executed_after >= self.config.n_trials:
             try:
                 study.set_user_attr("finished", True)
             except Exception:
@@ -877,7 +1120,17 @@ class NativeAbliterator:
         print()
         print("[bold green]Optimization finished![/]")
         cap_str = f" cap {chosen.user_attrs.get('capability', 0):.3f}" if "capability" in chosen.user_attrs else ""
-        print(f"* Best trial: [bold]{chosen.user_attrs['index']}[/] refusals {chosen.user_attrs['refusals']}/{len(evaluator.bad_prompts)} KL {chosen.user_attrs['kl_divergence']:.4f}{cap_str}")
+        refusals_str = (
+            f"{chosen.user_attrs['refusals']}/{len(evaluator.bad_prompts)}"
+            if chosen.user_attrs.get("refusals") is not None
+            else "n/a"
+        )
+        kl_str = (
+            f"{chosen.user_attrs['kl_divergence']:.4f}"
+            if chosen.user_attrs.get("kl_divergence") is not None
+            else "n/a"
+        )
+        print(f"* Best trial: [bold]{chosen.user_attrs['index']}[/] refusals {refusals_str} KL {kl_str}{cap_str}")
 
         # Re-apply best trial to model for export
         print("* Resetting model for final export...")
@@ -929,9 +1182,9 @@ class NativeAbliterator:
                         self.config.reproducibility_information == "full"
                     ),
                     metrics={
-                        "initial_refusals": evaluator.base_refusals,
-                        "final_refusals": chosen.user_attrs["refusals"],
-                        "total_prompts": len(evaluator.bad_prompts),
+                        "initial_refusals": evaluator.base_refusals if has_refusal_metrics else None,
+                        "final_refusals": chosen.user_attrs["refusals"] if has_refusal_metrics else None,
+                        "total_prompts": len(evaluator.bad_prompts) if has_refusal_metrics else None,
                         "kl_divergence": chosen.user_attrs["kl_divergence"],
                         "trials": len(study.trials),
                         "best_trial": chosen.user_attrs["index"],
@@ -953,8 +1206,8 @@ class NativeAbliterator:
         try:
             base_metrics = {
                 "model": self.config.model,
-                "initial_refusals": evaluator.base_refusals,
-                "total_prompts": len(evaluator.bad_prompts),
+                "initial_refusals": evaluator.base_refusals if has_refusal_metrics else None,
+                "total_prompts": len(evaluator.bad_prompts) if has_refusal_metrics else None,
                 "trials": len(study.trials),
             }
 
@@ -1023,13 +1276,15 @@ class NativeAbliterator:
         except Exception as e:
             print(f"[yellow]Could not write trial parameter files: {e}[/]")
 
-        # Save metrics
+        # Save metrics. Refusal counts are None when no refusal-measuring
+        # scorer is configured (rendered as "n/a" downstream, not fake zeros).
+        has_refusal_metrics = evaluator.refusal_prompt_total() > 0
         result = NativeAbliteratorResult(
             model_id=self.config.model,
             abliterated_model_path=str(output_dir),
-            initial_refusals=evaluator.base_refusals,
-            final_refusals=chosen.user_attrs["refusals"],
-            total_prompts=len(evaluator.bad_prompts),
+            initial_refusals=evaluator.base_refusals if has_refusal_metrics else None,
+            final_refusals=chosen.user_attrs["refusals"] if has_refusal_metrics else None,
+            total_prompts=len(evaluator.bad_prompts) if has_refusal_metrics else None,
             kl_divergence=chosen.user_attrs["kl_divergence"],
             trials=len(study.trials),
             best_trial=chosen.user_attrs["index"],
@@ -1095,6 +1350,18 @@ class NativeAbliterator:
 
         # Model loading
         model = Model(self.config)
+
+        # Whether refusal metrics are measurable at all (a keyword-rate-like
+        # scorer is configured). Decides the n/a vs real-number reporting for
+        # every result artifact below.
+        # Behavioral verification support: when the reproduction information
+        # contains recorded scores, load the same scorers so the reproduced
+        # model's behavior can be compared against the original run. Baselines
+        # are computed here, on the still-clean model.
+        evaluator = None
+        if reproduction_information.get("scores"):
+            evaluator = Evaluator(self.config, model)
+
         print()
         print(f"Loading good prompts from [bold]{self.config.good_prompts.dataset}[/]...")
         good_prompts = load_prompts(self.config, self.config.good_prompts)
@@ -1131,24 +1398,86 @@ class NativeAbliterator:
         print("* Abliterating with restored parameters...")
         model.abliterate(refusal_directions, direction_index, parameters)
 
+        # Behavioral verification: re-measure every recorded scorer on the
+        # reproduced model and compare with the original run's numbers.
+        score_verification = None
+        if evaluator is not None and reproduction_information.get("scores"):
+            print("* Verifying reproduced behavior against recorded scores...")
+            scores = evaluator.get_scores()
+            recorded = {s["name"]: s for s in reproduction_information["scores"]}
+            score_verification = {"scores": {}, "baselines": {}, "all_match": True}
+
+            def _compare(section, name, expected_value, got_value, expected_display, got_display):
+                match = (
+                    expected_value is not None
+                    and got_value is not None
+                    and math.isclose(float(got_value), float(expected_value), rel_tol=0.02, abs_tol=1e-6)
+                )
+                score_verification[section][name] = {
+                    "expected": expected_value,
+                    "got": got_value,
+                    "expected_display": expected_display,
+                    "got_display": got_display,
+                    "match": match,
+                }
+                if not match:
+                    score_verification["all_match"] = False
+                status = "[green]MATCH[/]" if match else "[red]MISMATCH[/]"
+                print(f"  * {name}: expected {expected_display}, reproduced {got_display} — {status}")
+
+            # Clean-model baselines recorded with the original run (proves the
+            # right base model was loaded) — except baselines that are 0 by
+            # definition (e.g. KL divergence of a model against itself).
+            for name, baseline_score in evaluator.baseline_scores:
+                expected = (
+                    recorded.get(name, {}).get("baseline", {}).get("value")
+                )
+                if expected == 0:
+                    continue
+                _compare(
+                    "baselines", name, expected, baseline_score.value,
+                    recorded.get(name, {}).get("baseline", {}).get("md_display", "?"),
+                    baseline_score.md_display,
+                )
+            for name, score in scores:
+                expected = recorded.get(name, {}).get("score", {}).get("value")
+                _compare(
+                    "scores", name, expected, score.value,
+                    recorded.get(name, {}).get("score", {}).get("md_display", "?"),
+                    score.md_display,
+                )
+            if score_verification["all_match"]:
+                print("[green]Behavior verified: all reproduced scores match the original run.[/]")
+            else:
+                print("[yellow]Behavior differs from the original run — see MISMATCH lines above.[/]")
+
         strategy = self._export_model(model, output_dir)
 
         # Verify that the exported weights match the originally published ones.
         hash_verification = verify_model_hashes(output_dir, original_hashes)
 
-        total_prompts = int(metrics.get("total_prompts") or len(bad_prompts))
+        def _metric_or_none(key, cast):
+            value = metrics.get(key)
+            return cast(value) if value is not None else None
+
+        total_prompts = (
+            _metric_or_none("total_prompts", int)
+            if metrics.get("total_prompts") is not None
+            else len(bad_prompts)
+        )
         result = NativeAbliteratorResult(
             model_id=self.config.model,
             abliterated_model_path=str(output_dir),
-            initial_refusals=int(metrics.get("initial_refusals") or 0),
-            final_refusals=int(metrics.get("final_refusals") or 0),
+            initial_refusals=_metric_or_none("initial_refusals", int),
+            final_refusals=_metric_or_none("final_refusals", int),
             total_prompts=total_prompts,
-            kl_divergence=float(metrics.get("kl_divergence") or 0.0),
+            kl_divergence=_metric_or_none("kl_divergence", float),
             trials=int(metrics.get("trials") or 0),
             best_trial=int(metrics.get("best_trial") or 0),
             config=self.config.to_dict(),
             hash_verification=hash_verification,
             reproduction_mode=True,
+            score_verification=score_verification,
         )
         result.config["export_strategy_effective"] = (
             strategy.value if hasattr(strategy, "value") else str(strategy)

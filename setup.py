@@ -24,13 +24,13 @@ if requirements_file.exists():
 
 setup(
     name="AnlordAbliterator",
-    version="1.2.0.post1",
+    version="1.3.0",
     description="Anlord Abliterator — automated LLM abliteration and evaluation",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Anlord Abliterator Development Team",
     author_email="anlixide@gmail.com",
-    url="https://github.com/justbedwarsplay/AnlordAbliterator",
+    url="https://github.com/anlord-project/anlord",
     license="AGPL-3.0",
     packages=find_packages(where="src"),
     package_dir={"": "src"},

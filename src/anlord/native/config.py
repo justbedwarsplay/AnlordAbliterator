@@ -160,6 +160,25 @@ class NativeConfig:
     # schema are applied.
     scorer_settings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # search acceleration (1.3.0)
+    # Upper bound of the max_weight search range. The 1.5 default matches the
+    # joint (attention+MLP) pipeline; attention-only runs benefit from a higher
+    # limit (e.g. 2.0) because attention alone has to carry the whole ablation.
+    max_weight_limit: float = 1.5
+    # How the per-layer refusal direction is derived from the residual vectors:
+    # "mean" (classic) or "median" (per-component median, robust to massive
+    # activations). Run-identity: recorded in reproduction bundles.
+    direction_source: str = "mean"
+    # Early abandonment of provably dominated trials: evaluate the cheap KL
+    # forward first, then refusal counts on batch-aligned prefixes of the
+    # evaluation set, and prune as soon as some completed trial is guaranteed
+    # to dominate this one. See docs/optimization_ideas.md.
+    evaluation_pruning: bool = True
+    pruning_fractions: List[float] = field(default_factory=lambda: [0.25, 0.5])
+    # Enqueue a few sensible starting configurations when a study is fresh, so
+    # the Pareto front forms immediately instead of after random exploration.
+    search_seeds: bool = True
+
     # debug / reproducibility metadata
     print_debug_information: bool = False
     # Which reproduction information to generate at export: "full" (settings,
@@ -285,15 +304,16 @@ class NativeConfig:
 
         # trials
         n_trials = getattr(settings, "abliteration_trials", 100)
-        n_startup = getattr(settings, "abliteration_trials", None)
-        # mimic AbliterationWrapper logic: n_startup ~ trials//3
-        if hasattr(settings, "n_startup_trials") and getattr(settings, "n_startup_trials", None) is not None:
-            n_startup_val = settings.n_startup_trials  # type: ignore
+        # Random-sampling startup trials: multivariate TPE models well after a
+        # couple dozen observations, so a third of the budget (the old rule)
+        # was wasted. Explicit user value always wins.
+        explicit_startup = getattr(settings, "abliteration_startup_trials", None)
+        if explicit_startup is not None:
+            n_startup_val = int(explicit_startup)
         else:
-            calc = max(2, n_trials // 3)
-            if calc >= n_trials:
-                calc = max(1, n_trials - 1)
-            n_startup_val = calc
+            n_startup_val = min(20, max(8, n_trials // 8))
+            if n_startup_val >= n_trials:
+                n_startup_val = max(1, n_trials - 1)
 
         # evaluation prompts count -> override split
         eval_count = getattr(settings, "abliteration_evaluation_prompts", 100)
@@ -368,6 +388,16 @@ class NativeConfig:
         if raw_repro_info not in {"full", "basic", "none"}:
             raise ValueError(f"Unsupported reproducibility_information: {raw_repro_info}")
 
+        direction_source = str(getattr(settings, "abliteration_direction_source", "mean") or "mean").lower()
+        if direction_source not in {"mean", "median"}:
+            raise ValueError(f"Unsupported direction_source: {direction_source}")
+        max_weight_limit = float(getattr(settings, "abliteration_max_weight_limit", 1.5) or 1.5)
+        if max_weight_limit <= 0.85:
+            raise ValueError(
+                "abliteration_max_weight_limit must be above 0.85 (the attention max_weight "
+                "search lower bound is 0.8)"
+            )
+
         return cls(
             model=getattr(settings, "model", "HuggingFaceTB/SmolLM2-135M"),
             model_commit=getattr(settings, "model_commit", None),
@@ -405,6 +435,11 @@ class NativeConfig:
             residual_plot_style=str(getattr(settings, "residual_plot_style", "dark_background")),
             scorers=scorers,
             scorer_settings=scorer_settings,
+            max_response_length=int(getattr(settings, "abliteration_max_response_length", 64) or 64),
+            max_weight_limit=max_weight_limit,
+            direction_source=direction_source,
+            evaluation_pruning=bool(getattr(settings, "abliteration_pruning", True)),
+            search_seeds=bool(getattr(settings, "search_seeds", True)),
             print_debug_information=bool(getattr(settings, "print_debug_information", False)),
             reproducibility_information=raw_repro_info,
             ignore_mismatches=getattr(settings, "ignore_mismatches", None),

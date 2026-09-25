@@ -21,3 +21,4 @@ tmp_*.json
 tmp_tiny_*/
 .pytest_cache/
 .native_init_marker
+dist/

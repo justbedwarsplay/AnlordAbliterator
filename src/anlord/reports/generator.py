@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..evaluation.comparison import ComparisonResult
+from ..evaluation.comparison import format_optional as fmt
 from ..evaluation.evaluator import EvaluationResult
 
 logger = logging.getLogger(__name__)
@@ -140,20 +141,30 @@ class ReportGenerator:
             writer.writerow(
                 [
                     "Initial Refusals",
-                    comparison.initial_refusals_baseline,
-                    comparison.initial_refusals_abliterated,
-                    comparison.initial_refusals_abliterated - comparison.initial_refusals_baseline,
+                    fmt(comparison.initial_refusals_baseline),
+                    fmt(comparison.initial_refusals_abliterated),
+                    fmt(
+                        None
+                        if comparison.initial_refusals_baseline is None
+                        or comparison.initial_refusals_abliterated is None
+                        else comparison.initial_refusals_abliterated - comparison.initial_refusals_baseline
+                    ),
                 ]
             )
             writer.writerow(
                 [
                     "Final Refusals",
-                    comparison.final_refusals_baseline,
-                    comparison.final_refusals_abliterated,
-                    comparison.final_refusals_abliterated - comparison.final_refusals_baseline,
+                    fmt(comparison.final_refusals_baseline),
+                    fmt(comparison.final_refusals_abliterated),
+                    fmt(
+                        None
+                        if comparison.final_refusals_baseline is None
+                        or comparison.final_refusals_abliterated is None
+                        else comparison.final_refusals_abliterated - comparison.final_refusals_baseline
+                    ),
                 ]
             )
-            writer.writerow(["KL Divergence", "-", f"{comparison.kl_divergence:.6f}", "-"])
+            writer.writerow(["KL Divergence", "-", fmt(comparison.kl_divergence, "{:.6f}"), "-"])
             writer.writerow([])
 
             # Benchmark comparison
@@ -443,15 +454,15 @@ class ReportGenerator:
             
             <div class="metrics-grid">
                 <div class="metric-card">
-                    <div class="metric-value">{comparison.refusal_reduction_percent:.1f}%</div>
+                    <div class="metric-value">{fmt(comparison.refusal_reduction_percent, "{:.1f}%")}</div>
                     <div class="metric-label">Refusal Reduction</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value">{comparison.final_refusals_abliterated}</div>
+                    <div class="metric-value">{fmt(comparison.final_refusals_abliterated)}</div>
                     <div class="metric-label">Final Refusals</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value">{comparison.kl_divergence:.4f}</div>
+                    <div class="metric-value">{fmt(comparison.kl_divergence, "{:.4f}")}</div>
                     <div class="metric-label">KL Divergence</div>
                 </div>
                 <div class="metric-card">
@@ -466,15 +477,15 @@ class ReportGenerator:
             
             <div class="metrics-grid">
                 <div class="metric-card">
-                    <div class="metric-value">{comparison.initial_refusals_baseline}</div>
+                    <div class="metric-value">{fmt(comparison.initial_refusals_baseline)}</div>
                     <div class="metric-label">Initial Refusals (Baseline)</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value">{comparison.initial_refusals_abliterated}</div>
+                    <div class="metric-value">{fmt(comparison.initial_refusals_abliterated)}</div>
                     <div class="metric-label">Initial Refusals (Abliterated)</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value">{comparison.final_refusals_baseline}</div>
+                    <div class="metric-value">{fmt(comparison.final_refusals_baseline)}</div>
                     <div class="metric-label">Final Refusals (Baseline)</div>
                 </div>
                 <div class="metric-card">
@@ -484,7 +495,7 @@ class ReportGenerator:
             </div>
             
             <div class="info-box">
-                <p><strong>KL Divergence: {comparison.kl_divergence:.6f}</strong></p>
+                <p><strong>KL Divergence: {fmt(comparison.kl_divergence, "{:.6f}")}</strong></p>
                 <p><strong>Important:</strong> KL divergence is NOT a percentage of retained quality. It measures the statistical distance between the original and abliterated model distributions. A lower KL divergence indicates less model drift, but does not directly correlate with capability preservation.</p>
             </div>
         </section>

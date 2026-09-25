@@ -7,6 +7,7 @@ Provides various output format utilities.
 import json
 
 from ..evaluation.comparison import ComparisonResult
+from ..evaluation.comparison import format_optional as fmt
 
 
 def format_json(comparison: ComparisonResult, indent: int = 2) -> str:
@@ -44,13 +45,23 @@ def format_csv(comparison: ComparisonResult) -> str:
     # Refusal metrics
     lines.append("Refusal Metrics")
     lines.append("Metric,Baseline,Abliterated,Change")
-    lines.append(
-        f"Initial Refusals,{comparison.initial_refusals_baseline},{comparison.initial_refusals_abliterated},{comparison.initial_refusals_abliterated - comparison.initial_refusals_baseline}"
+    initial_delta = (
+        None
+        if comparison.initial_refusals_baseline is None or comparison.initial_refusals_abliterated is None
+        else comparison.initial_refusals_abliterated - comparison.initial_refusals_baseline
+    )
+    final_delta = (
+        None
+        if comparison.final_refusals_baseline is None or comparison.final_refusals_abliterated is None
+        else comparison.final_refusals_abliterated - comparison.final_refusals_baseline
     )
     lines.append(
-        f"Final Refusals,{comparison.final_refusals_baseline},{comparison.final_refusals_abliterated},{comparison.final_refusals_abliterated - comparison.final_refusals_baseline}"
+        f"Initial Refusals,{fmt(comparison.initial_refusals_baseline)},{fmt(comparison.initial_refusals_abliterated)},{fmt(initial_delta)}"
     )
-    lines.append(f"KL Divergence,-,{comparison.kl_divergence:.6f},-")
+    lines.append(
+        f"Final Refusals,{fmt(comparison.final_refusals_baseline)},{fmt(comparison.final_refusals_abliterated)},{fmt(final_delta)}"
+    )
+    lines.append(f"KL Divergence,-,{fmt(comparison.kl_divergence, '{:.6f}')},-")
     lines.append("")
 
     # Benchmarks

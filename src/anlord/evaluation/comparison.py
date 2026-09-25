@@ -6,11 +6,17 @@ Compares baseline and abliterated model performance.
 
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 from datetime import datetime
 
 from .evaluator import EvaluationResult
 
 logger = logging.getLogger(__name__)
+
+
+def format_optional(value, spec: str = "{}") -> str:
+    """Renders an optional metric: "n/a" when unknown, formatted otherwise."""
+    return "n/a" if value is None else spec.format(value)
 
 
 @dataclass
@@ -20,12 +26,12 @@ class ComparisonResult:
     model_id: str
     timestamp: str = ""
 
-    # Refusal metrics
-    initial_refusals_baseline: int = 0
-    initial_refusals_abliterated: int = 0
-    final_refusals_baseline: int = 0
-    final_refusals_abliterated: int = 0
-    kl_divergence: float = 0.0
+    # Refusal metrics (None = not measured, rendered as "n/a")
+    initial_refusals_baseline: Optional[int] = None
+    initial_refusals_abliterated: Optional[int] = None
+    final_refusals_baseline: Optional[int] = None
+    final_refusals_abliterated: Optional[int] = None
+    kl_divergence: Optional[float] = None
 
     # Benchmark comparison
     benchmarks: dict = field(default_factory=dict)
@@ -56,16 +62,21 @@ class ComparisonResult:
         }
 
     @property
-    def refusal_reduction(self) -> int:
-        """Total reduction in refusals."""
+    def refusal_reduction(self) -> Optional[int]:
+        """Total reduction in refusals (None when not measured)."""
+        if self.final_refusals_baseline is None or self.final_refusals_abliterated is None:
+            return None
         return self.final_refusals_baseline - self.final_refusals_abliterated
 
     @property
-    def refusal_reduction_percent(self) -> float:
-        """Percentage reduction in refusals."""
-        if self.final_refusals_baseline == 0:
+    def refusal_reduction_percent(self) -> Optional[float]:
+        """Percentage reduction in refusals (None when not measured)."""
+        reduction = self.refusal_reduction
+        if reduction is None:
+            return None
+        if not self.final_refusals_baseline:
             return 0.0
-        return (self.refusal_reduction / self.final_refusals_baseline) * 100
+        return (reduction / self.final_refusals_baseline) * 100
 
 
 def compare_results(
@@ -144,7 +155,7 @@ def compare_results(
     )
 
     # Add warnings
-    if comparison.kl_divergence > 1.0:
+    if comparison.kl_divergence is not None and comparison.kl_divergence > 1.0:
         comparison.warnings.append(
             f"KL divergence ({comparison.kl_divergence:.3f}) is relatively high. "
             "The abliterated model may have diverged significantly from the original."

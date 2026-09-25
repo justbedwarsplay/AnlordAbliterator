@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -23,16 +23,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AbliterationResult:
-    """Results from abliteration evaluation and optimization."""
+    """Results from abliteration evaluation and optimization.
+
+    Refusal metrics are None when no refusal-measuring scorer is configured
+    (they are reported as "n/a" instead of fake zeros).
+    """
 
     model_id: str
     abliterated_model_path: Optional[str] = None
-    initial_refusals: int = 0
-    final_refusals: int = 0
-    total_prompts: int = 0
-    initial_refusal_rate: float = 0.0
-    final_refusal_rate: float = 0.0
-    kl_divergence: float = 0.0
+    initial_refusals: Optional[int] = None
+    final_refusals: Optional[int] = None
+    total_prompts: Optional[int] = None
+    initial_refusal_rate: Optional[float] = None
+    final_refusal_rate: Optional[float] = None
+    kl_divergence: Optional[float] = None
     trials: int = 0
     best_trial: int = 0
     evaluation_time_seconds: float = 0.0

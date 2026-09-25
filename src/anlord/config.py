@@ -117,6 +117,22 @@ class Settings:
     # prefix ["attn"] to ablate only attention and leave MLP untouched).
     # None = all abliterable components of the model.
     abliteration_components: Optional[list] = None
+
+    # Search acceleration (1.3.0). See docs/optimization_ideas.md.
+    # Random-sampling startup trials for TPE (None = automatic, ~min(20, n/8)).
+    abliteration_startup_trials: Optional[int] = None
+    # Maximum generated tokens when counting refusals during trials.
+    abliteration_max_response_length: int = 64
+    # Upper bound of the max_weight search range (raise to 2.0+ for
+    # attention-only runs so attention alone can carry the ablation).
+    abliteration_max_weight_limit: float = 1.5
+    # Refusal direction source: "mean" or "median" (per-component median of the
+    # residual vectors, robust to massive activations). Recorded in bundles.
+    abliteration_direction_source: str = "mean"
+    # Early abandonment of provably dominated trials (multi-fidelity evaluation).
+    abliteration_pruning: bool = True
+    # Enqueue sensible starting configurations when a study is fresh.
+    search_seeds: bool = True
     capability_proxy: bool = False
     capability_proxy_enabled: bool = False
     capability_proxy_dataset: str = "cais/mmlu"
@@ -243,6 +259,22 @@ class Settings:
                 raise ValueError(
                     "abliteration_components cannot be empty; omit it to ablate all components"
                 )
+        if self.abliteration_startup_trials is not None and (
+            self.abliteration_startup_trials < 0
+        ):
+            raise ValueError("abliteration_startup_trials cannot be negative")
+        if self.abliteration_max_response_length < 8:
+            raise ValueError("abliteration_max_response_length must be at least 8 tokens")
+        self.abliteration_direction_source = str(self.abliteration_direction_source).lower()
+        if self.abliteration_direction_source not in {"mean", "median"}:
+            raise ValueError(
+                f"Unsupported abliteration_direction_source: {self.abliteration_direction_source}"
+            )
+        if self.abliteration_max_weight_limit <= 0.85:
+            raise ValueError(
+                "abliteration_max_weight_limit must be above 0.85 (the attention max_weight "
+                "search lower bound is 0.8)"
+            )
         if self.row_normalization not in {"none", "pre", "full"}:
             raise ValueError(f"Unsupported row_normalization: {self.row_normalization}")
         if self.dtype not in {"auto", "float16", "bfloat16", "float32"}:

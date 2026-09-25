@@ -236,6 +236,13 @@ def test_reproduction_from_saved_trial_file(run_result):
     ), repro_result.hash_verification
     assert collect_model_hashes(repro_dir) == saved["hashes"]
 
+    # Behavioral verification: reproduced scores must match the recorded ones.
+    assert repro_result.score_verification is not None
+    assert repro_result.score_verification["all_match"] is True, (
+        repro_result.score_verification
+    )
+    assert set(repro_result.score_verification["scores"]) == {"Refusals", "KL divergence"}
+
 
 def test_attention_only_run_and_reproduction(tmp_path):
     """--components attn: only attention is optimized and ablated, the include

@@ -148,6 +148,49 @@ Examples:
         "leaves MLP untouched. Default: all abliterable components",
     )
 
+    # Search acceleration
+    search_group = parser.add_argument_group("Search Acceleration")
+    search_group.add_argument(
+        "--startup-trials",
+        type=int,
+        default=None,
+        help="Random-sampling startup trials for TPE (default: automatic, ~min(20, trials/8))",
+    )
+    search_group.add_argument(
+        "--max-response-length",
+        type=int,
+        default=64,
+        help="Maximum generated tokens when counting refusals during trials (default: 64)",
+    )
+    search_group.add_argument(
+        "--max-weight-limit",
+        type=float,
+        default=1.5,
+        help="Upper bound of the max_weight search range; raise to 2.0+ for attention-only "
+        "runs so attention alone can carry the ablation (default: 1.5)",
+    )
+    search_group.add_argument(
+        "--direction-source",
+        type=str,
+        choices=["mean", "median"],
+        default="mean",
+        help="How to derive the refusal direction from residual vectors: mean (classic) or "
+        "per-component median, robust to massive activations (default: mean)",
+    )
+    search_group.add_argument(
+        "--pruning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Early abandonment of provably dominated trials: cheap KL first, then refusal "
+        "counts on prefixes of the evaluation set (default: on)",
+    )
+    search_group.add_argument(
+        "--search-seeds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enqueue sensible starting configurations when a study is fresh (default: on)",
+    )
+
     # Residual analysis
     residual_group = parser.add_argument_group("Residual Analysis")
     residual_group.add_argument(
@@ -393,6 +436,12 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         capability_proxy=getattr(args, "capability_proxy", False),
         capability_proxy_enabled=getattr(args, "capability_proxy", False),
         abliteration_components=components,
+        abliteration_startup_trials=getattr(args, "startup_trials", None),
+        abliteration_max_response_length=getattr(args, "max_response_length", 64),
+        abliteration_max_weight_limit=getattr(args, "max_weight_limit", 1.5),
+        abliteration_direction_source=getattr(args, "direction_source", "mean"),
+        abliteration_pruning=getattr(args, "pruning", True),
+        search_seeds=getattr(args, "search_seeds", True),
         scorers=scorers,
         print_residual_geometry=getattr(args, "print_residual_geometry", False),
         plot_residuals=getattr(args, "plot_residuals", False),
@@ -496,6 +545,18 @@ def apply_explicit_cli_overrides(settings: Settings, args: argparse.Namespace) -
         settings.abliteration_components = [
             c.strip() for c in args.components.split(",") if c.strip()
         ]
+    if getattr(args, "startup_trials", None) is not None:
+        settings.abliteration_startup_trials = args.startup_trials
+    if getattr(args, "max_response_length", None) is not None:
+        settings.abliteration_max_response_length = args.max_response_length
+    if getattr(args, "max_weight_limit", None) is not None:
+        settings.abliteration_max_weight_limit = args.max_weight_limit
+    if getattr(args, "direction_source", None):
+        settings.abliteration_direction_source = args.direction_source
+    if getattr(args, "pruning", None) is not None:
+        settings.abliteration_pruning = args.pruning
+    if getattr(args, "search_seeds", None) is not None:
+        settings.search_seeds = args.search_seeds
     if getattr(args, "residual_plot_path", None):
         settings.residual_plot_path = args.residual_plot_path
 

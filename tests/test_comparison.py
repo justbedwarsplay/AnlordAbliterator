@@ -21,7 +21,10 @@ class TestComparisonResult:
         result = ComparisonResult(model_id="test/model")
 
         assert result.model_id == "test/model"
-        assert result.kl_divergence == 0.0
+        # Unmeasured metrics default to None ("n/a"), not fake zeros.
+        assert result.kl_divergence is None
+        assert result.final_refusals_baseline is None
+        assert result.refusal_reduction is None
         assert result.benchmarks == {}
         assert len(result.warnings) == 0
 
@@ -82,7 +85,8 @@ class TestCompareResults:
         result = compare_results(baseline, abliterated)
 
         assert result.model_id == "test/model"
-        assert result.final_refusals_baseline == 0
+        # No abliteration metrics -> unknown, not fake zeros.
+        assert result.final_refusals_baseline is None
 
 
 class TestDeltaTable:

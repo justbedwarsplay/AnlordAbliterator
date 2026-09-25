@@ -37,6 +37,10 @@ class KLDivergence(Scorer):
 
     settings: Settings
 
+    # Class-level default so the scorer is detectable before its first
+    # get_score() call (used by the evaluator's quick-evaluation methods).
+    last_kl_value: float = 0.0
+
     @property
     def reproducible(self) -> bool:
         return True
