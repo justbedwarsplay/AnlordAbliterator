@@ -29,7 +29,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Anlord Abliterator Development Team",
-    author_email="anlord@example.com",
+    author_email="anlixide@gmail.com",
     url="https://github.com/justbedwarsplay/AnlordAbliterator",
     license="AGPL-3.0",
     packages=find_packages(where="src"),

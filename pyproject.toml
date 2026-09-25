@@ -5,7 +5,7 @@ description = "Anlord Abliterator — automated LLM abliteration and evaluation"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
 authors = [
-    { name = "Anlord Abliterator Development Team" }
+    { name = "Anlord Abliterator Development Team", email = "anlixide@gmail.com" }
 ]
 requires-python = ">=3.10"
 keywords = ["llm", "abliteration", "benchmark", "evaluation"]
