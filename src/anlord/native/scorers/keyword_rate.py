@@ -114,10 +114,37 @@ class KeywordRate(Scorer):
         )
         self.prompts: list[Prompt] = ctx.load_prompts(self.settings.prompts)
         print(f"* [bold]{len(self.prompts)}[/] prompts loaded")
+        # Trial-scoped response cache keyed by absolute batch index: batch i
+        # holds responses for prompts[i*bs:(i+1)*bs] — exactly the batches the
+        # full evaluation generates, so multi-fidelity prefix steps reuse them
+        # without changing any result.
+        self._batch_responses: dict = {}
+
+    def clear_batch_cache(self) -> None:
+        self._batch_responses.clear()
+
+    def _ensure_batches(self, ctx: Context, n_batches: int) -> None:
+        """Generates any of the first `n_batches` grid-aligned response batches
+        that are not cached yet."""
+        bs = ctx.batch_size
+        total = len(self.prompts)
+        for bi in range(min(n_batches, max(1, -(-total // bs)))):
+            if bi in self._batch_responses:
+                continue
+            lo, hi = bi * bs, min((bi + 1) * bs, total)
+            if lo >= hi:
+                break
+            self._batch_responses[bi] = ctx.get_responses(self.prompts[lo:hi])
 
     def get_score(self, ctx: Context) -> Score:
+        bs = ctx.batch_size
+        n_batches = max(1, -(-len(self.prompts) // bs))
+        self._ensure_batches(ctx, n_batches)
+        responses = []
+        for bi in range(n_batches):
+            responses.extend(self._batch_responses[bi])
+        responses = responses[: len(self.prompts)]
         match_count = 0
-        responses = ctx.get_responses(self.prompts)
         for prompt, response in zip(self.prompts, responses):
             is_match = self._is_match(response)
             if is_match:

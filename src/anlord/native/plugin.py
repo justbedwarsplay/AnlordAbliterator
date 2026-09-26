@@ -205,6 +205,11 @@ class Context:
     def load_prompts(self, specification: DatasetSpecification) -> list[Prompt]:
         return load_prompts(self._settings, specification)
 
+    @property
+    def batch_size(self) -> int:
+        """Effective generation batch size (always >= 1)."""
+        return max(1, int(getattr(self._settings, "batch_size", 0) or 1))
+
 
 class Plugin:
     """

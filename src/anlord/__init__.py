@@ -11,7 +11,7 @@ import os
 __author__ = "Anlord Abliterator Development Team"
 
 # Release constant, kept in sync with pyproject.toml on every release.
-_FALLBACK_VERSION = "1.3.0"
+_FALLBACK_VERSION = "1.4.0"
 
 # The reported version must match how the code is actually running:
 # - installed wheel (site-packages) -> read the pip distribution metadata,

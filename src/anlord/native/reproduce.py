@@ -181,11 +181,12 @@ def format_version_information(version_information: dict[str, Any]) -> str:
                 raise ValueError(
                     f"unknown metadata.type value in version information: {metadata['type']}"
                 )
-    elif ver == "unknown":
-        # The distribution could not be located at all (e.g. running directly
-        # from a source checkout). Use a stable value so that comparing two
-        # equally undeterminable versions doesn't report a phantom mismatch.
-        return "unknown"
+    elif not metadata:
+        # The distribution origin could not be determined (source checkout,
+        # bare egg-info, ...). Use a stable value so that comparing two
+        # equally undeterminable environments doesn't report a phantom
+        # mismatch; the random suffix stays only for real local installs.
+        return ver
     else:
         import random
 

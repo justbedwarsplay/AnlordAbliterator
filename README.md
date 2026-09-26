@@ -42,6 +42,8 @@
 | **🧪 Extended suite** | **29 tasks / 17 families** — 6 classic + GPQA, MMLU-Pro, Ifstruct, ParseBench, ExtractBench, ScreenSpot-Pro, MMMU-Pro. All selectable via `--tasks` or checkbox |
 | **⚖️ Before → After** | Same benchmarks run on baseline and abliterated models, `comparison.json` with deltas |
 | **⚡ Search acceleration** | Multi-fidelity pruning of dominated trials (cheap KL first, refusal prefixes next), seed trials for fresh studies, 20 startup trials, 64-token refusal counting — a 200-trial run fits in ~1.5 h on an 8 GB GPU |
+| **🎭 Staged search** *(experimental)* | Stage 1 optimizes attention only, stage 2 optimizes MLP on top of the frozen attention winner (±20% rescale). Underperformed the joint search on Qwen3.5-0.8B — off by default |
+| **🎯 Silhouette-guided bounds** | The max_weight_position range is lower-bounded by the first residual layer with meaningful good/bad cluster separation — no wasted trials in dead zones |
 | **🧪 Behavioral reproduction check** | `--reproduce` re-measures refusals and KL on the reproduced model and prints MATCH/MISMATCH against the original run |
 | **💻 Hardware-aware** | `psutil` + `pynvml` monitoring. `HardwarePlanner` auto-selects load-time `quantization` / `device_map` / `max_memory` / `batch_size` for your GPU (see note below) |
 | **📝 Reports** | Interactive `report.html` + `report.json` + `report.csv` + per-benchmark `*.json` |
@@ -239,12 +241,17 @@ Search acceleration:
   --pruning / --no-pruning       early abandonment of dominated trials (default on)
   --search-seeds / --no-search-seeds   seed configs for fresh studies (default on)
 
-Benchmarks:
-  --tasks, --benchmarks, -b   see table above
-  --mode                 quick | full
-  --limit, -l            samples per benchmark (quick default 100)
-  --num-fewshot          override few-shot
-  --native-benchmarks / --no-native-benchmarks  (default native)
+Search acceleration (1.4.0):
+  --startup-trials       random-sampling TPE startup (default: automatic, ~min(20, n/8))
+  --max-response-length  refusal-counting generation cap (default 64)
+  --max-weight-limit     max_weight ceiling (default 1.5; raise to 2.0+ for attention-only)
+  --direction-source     mean | median (robust to massive activations)
+  --pruning / --no-pruning       early abandonment of dominated trials (default on)
+  --search-seeds / --no-search-seeds   seed configs for fresh studies (default on)
+  --staged-search                EXPERIMENTAL two-stage search: attention first, then MLP (underperformed joint search on Qwen3.5-0.8B)
+  --staged-stage1-fraction       fraction of trials in stage 1 (default 0.4)
+  --silhouette-guided-bounds     silhouette-based position lower bound
+
 
 Hardware (load-time only, not saved):
   --dtype                auto | float16 | bfloat16 | float32
@@ -331,7 +338,9 @@ AnlordAbliterator --reproduce username/model-name
 The pipeline restores the original settings and parameters, re-applies the ablation, exports
 the model and checks the SHA-256 hashes of the weight files (`reproduction_hashes.json`).
 It then re-measures every recorded scorer on the reproduced model (refusals, KL, ...) and
-prints MATCH/MISMATCH against the original run's numbers.
+prints MATCH/MISMATCH against the original run's numbers. Response batches generated
+Response batches generated during early-abandonment checks are cached and reused by the full evaluation.
+during early-abandonment checks are cached and reused by the full evaluation.
 Environment differences are reported in a table; `--ignore-mismatches` proceeds anyway.
 
 ## Scorer plugins

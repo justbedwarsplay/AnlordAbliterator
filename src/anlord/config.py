@@ -133,6 +133,14 @@ class Settings:
     abliteration_pruning: bool = True
     # Enqueue sensible starting configurations when a study is fresh.
     search_seeds: bool = True
+
+    # Staged search (1.4.0): stage 1 optimizes attention only, stage 2
+    # optimizes MLP on top of the frozen stage-1 attention winner.
+    staged_search: bool = False
+    # Fraction of n_trials spent in stage 1 (attention-only).
+    staged_stage1_fraction: float = 0.4
+    # Silhouette-guided position bounds (experimental).
+    silhouette_guided_bounds: bool = False
     capability_proxy: bool = False
     capability_proxy_enabled: bool = False
     capability_proxy_dataset: str = "cais/mmlu"
@@ -314,6 +322,8 @@ class Settings:
             raise ValueError("scorer_settings must be a dict of namespace tables")
         if self.ignore_mismatches is not None and not isinstance(self.ignore_mismatches, bool):
             raise ValueError("ignore_mismatches must be a boolean or None")
+        if not 0.05 <= self.staged_stage1_fraction <= 0.95:
+            raise ValueError("staged_stage1_fraction must be within [0.05, 0.95]")
         if self.abliteration_trials < 1:
             raise ValueError("abliteration_trials must be at least 1")
         if self.abliteration_timeout < 1:

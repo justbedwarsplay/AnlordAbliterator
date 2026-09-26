@@ -190,6 +190,26 @@ Examples:
         default=True,
         help="Enqueue sensible starting configurations when a study is fresh (default: on)",
     )
+    search_group.add_argument(
+        "--staged-search",
+        action="store_true",
+        default=False,
+        help="Staged search: stage 1 optimizes attention only, stage 2 optimizes MLP on top "
+        "of the frozen stage-1 attention winner (needs attention+MLP components)",
+    )
+    search_group.add_argument(
+        "--staged-stage1-fraction",
+        type=float,
+        default=0.4,
+        help="Fraction of n_trials spent in stage 1 (attention-only); default 0.4",
+    )
+    search_group.add_argument(
+        "--silhouette-guided-bounds",
+        action="store_true",
+        default=False,
+        help="Lower-bound the max_weight_position search range by the first residual layer "
+        "with meaningful good/bad cluster separation (silhouette-based, experimental)",
+    )
 
     # Residual analysis
     residual_group = parser.add_argument_group("Residual Analysis")
@@ -442,6 +462,9 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         abliteration_direction_source=getattr(args, "direction_source", "mean"),
         abliteration_pruning=getattr(args, "pruning", True),
         search_seeds=getattr(args, "search_seeds", True),
+        staged_search=getattr(args, "staged_search", False),
+        staged_stage1_fraction=getattr(args, "staged_stage1_fraction", 0.4),
+        silhouette_guided_bounds=getattr(args, "silhouette_guided_bounds", False),
         scorers=scorers,
         print_residual_geometry=getattr(args, "print_residual_geometry", False),
         plot_residuals=getattr(args, "plot_residuals", False),
@@ -557,6 +580,10 @@ def apply_explicit_cli_overrides(settings: Settings, args: argparse.Namespace) -
         settings.abliteration_pruning = args.pruning
     if getattr(args, "search_seeds", None) is not None:
         settings.search_seeds = args.search_seeds
+    if getattr(args, "staged_search", False):
+        settings.staged_search = True
+    if getattr(args, "silhouette_guided_bounds", False):
+        settings.silhouette_guided_bounds = True
     if getattr(args, "residual_plot_path", None):
         settings.residual_plot_path = args.residual_plot_path
 

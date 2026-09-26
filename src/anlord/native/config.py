@@ -199,6 +199,18 @@ class NativeConfig:
     # Names are matched exactly or by prefix ("attn" matches "attn.o_proj").
     abliteration_components: Optional[List[str]] = None
 
+    # Staged search (1.4.0): stage 1 optimizes attention components only
+    # (MLP frozen at identity), stage 2 freezes the stage-1 attention winner
+    # (with a +/-20% max_weight rescale) and optimizes the MLP components.
+    # Requires both attention and MLP components; auto-disables otherwise.
+    staged_search: bool = False
+    # Fraction of n_trials spent in stage 1 (attention-only).
+    staged_stage1_fraction: float = 0.4
+    # Silhouette-guided bounds (1.4.0): compute per-layer silhouette scores of
+    # the good/bad residual clusters and lower-bound the max_weight_position
+    # search range by the first layer with meaningful cluster separation.
+    silhouette_guided_bounds: bool = False
+
     # capability proxy (feature 2): 3rd objective to preserve MMLU
     capability_proxy_enabled: bool = False
     capability_proxy_dataset: str = "cais/mmlu"
@@ -423,6 +435,9 @@ class NativeConfig:
                 if getattr(settings, "abliteration_components", None)
                 else None
             ),
+            staged_search=bool(getattr(settings, "staged_search", False)),
+            staged_stage1_fraction=float(getattr(settings, "staged_stage1_fraction", 0.4) or 0.4),
+            silhouette_guided_bounds=bool(getattr(settings, "silhouette_guided_bounds", False)),
             capability_proxy_enabled=bool(getattr(settings, "capability_proxy_enabled", False) or getattr(settings, "capability_proxy", False)),
             capability_proxy_dataset=str(getattr(settings, "capability_proxy_dataset", "cais/mmlu")),
             capability_proxy_subset=str(getattr(settings, "capability_proxy_subset", "abstract_algebra")),

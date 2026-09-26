@@ -363,22 +363,41 @@ class Evaluator:
 
     def quick_refusals(self, k: int) -> Optional[int]:
         """
-        Refusal count on the first k prompts of the keyword-rate evaluation set.
-
-        The prompts are generated in batches aligned with the configured batch
-        size, so these counts are exact prefix counts of the full evaluation.
+        Refusal count on the first k prompts of the keyword-rate evaluation
+        set, generated in grid-aligned batches that the full evaluation would
+        produce (so the counts are exact prefix counts). Responses are cached
+        per batch inside the scorer and reused by the full evaluation.
         Returns None when no keyword-rate-like scorer is configured.
         """
         for entry in self._scorer_entries:
             scorer = entry.scorer
             count_matches = getattr(scorer, "count_matches", None)
             prompts = getattr(scorer, "prompts", None)
-            if count_matches is not None and prompts and hasattr(entry.scorer, "prompts"):
-                limited = list(prompts)[:k]
+            cache = getattr(scorer, "_batch_responses", None)
+            if count_matches is None or not prompts or cache is None:
+                continue
+            bs = max(1, int(getattr(self.settings, "batch_size", 0) or 1))
+            total = len(prompts)
+            n_batches = min(-(-k // bs), -(-total // bs))
+            for bi in range(n_batches):
+                if bi in cache:
+                    continue
+                lo, hi = bi * bs, min((bi + 1) * bs, total)
+                if lo >= hi:
+                    break
                 ctx = Context(settings=self.settings, model=self.model)
-                responses = ctx.get_responses(limited)
-                return int(count_matches(responses))
+                cache[bi] = ctx.get_responses(prompts[lo:hi])
+            cached = [r for bi in range(n_batches) for r in cache[bi]]
+            return int(count_matches(cached[:k]))
         return None
+
+    def clear_response_caches(self) -> None:
+        """Clears trial-scoped response caches (call at every trial start: the
+        model changes between trials)."""
+        for entry in self._scorer_entries:
+            cache = getattr(entry.scorer, "_batch_responses", None)
+            if cache is not None:
+                cache.clear()
 
     def refusal_prompt_total(self) -> int:
         """Total number of prompts in the keyword-rate evaluation set (0 if absent)."""

@@ -77,6 +77,45 @@ _DISPLAY_ONLY_NATIVE_FIELDS = frozenset(
 )
 
 
+def _silhouette_position_low(silh_scores: list[float]) -> float:
+    """
+    1-based layer index where meaningful good/bad cluster separation starts
+    (layers scoring at least half of the best silhouette). Used as the lower
+    bound of the max_weight_position search range.
+    """
+    top = max(silh_scores)
+    if top <= 0:
+        return 1.0
+    meaningful = [i for i, s in enumerate(silh_scores, start=1) if s >= 0.5 * top]
+    return float(min(meaningful)) if meaningful else 1.0
+
+
+def _stage_best_params(study, stage_value, components) -> Optional[dict]:
+    """
+    The best (fewest refusals, then lowest KL) parameter set among completed
+    trials of the given staged-search stage, restricted to `components`.
+    """
+    best = None
+    for tr in study.trials:
+        if tr.state != TrialState.COMPLETE:
+            continue
+        if tr.user_attrs.get("stage") != stage_value:
+            continue
+        refusals = tr.user_attrs.get("refusals")
+        kl = tr.user_attrs.get("kl_divergence")
+        if refusals is None or kl is None:
+            continue
+        key = (int(refusals), float(kl))
+        if best is None or key < best[0]:
+            best = (key, tr)
+    if best is None:
+        return None
+    raw = best[1].user_attrs.get("parameters") or {}
+    from .model import AbliterationParameters as _AP
+
+    return {c: _AP(**raw[c]) for c in components if c in raw}
+
+
 def max_weight_bounds(component: str, max_weight_limit: float) -> tuple[float, float]:
     """
     Search bounds for a component's max_weight.
@@ -547,6 +586,14 @@ class NativeAbliterator:
             },
         ]
 
+        if getattr(self.config, "staged_search", False):
+            # Stage 1 is attention-only: neutralize MLP parts of the seeds so
+            # they stay consistent with the staged design.
+            for seed in seeds:
+                for key in list(seed):
+                    if key.startswith("mlp.") and (key.endswith("max_weight") or key.endswith("min_weight")):
+                        seed[key] = 0.0
+
         print(f"* Enqueueing {len(seeds)} seed trials for the fresh study")
         for seed in seeds[: self.config.n_trials]:
             try:
@@ -626,6 +673,30 @@ class NativeAbliterator:
                     analyzer.print_residual_geometry()
                 if self.config.plot_residuals:
                     analyzer.plot_residuals()
+
+            if getattr(self.config, "silhouette_guided_bounds", False):
+                # Per-layer silhouette of the good/bad residual clusters: the
+                # first layer with meaningful separation lower-bounds the
+                # max_weight_position search range (positions below it are dead
+                # zones the optimizer would waste trials on).
+                try:
+                    from sklearn.metrics import silhouette_score
+
+                    silh = []
+                    n_layers = len(model.get_layers())
+                    for li in range(1, n_layers + 1):
+                        X = torch.cat(
+                            [good_residuals[:, li, :], bad_residuals[:, li, :]]
+                        ).detach().cpu().numpy()
+                        labels = [0] * good_residuals.shape[0] + [1] * bad_residuals.shape[0]
+                        silh.append(float(silhouette_score(X, labels)))
+                    self._silhouette_position_low = _silhouette_position_low(silh)
+                    print(
+                        f"* Silhouette-guided position lower bound: layer "
+                        f"{self._silhouette_position_low:.0f} of {n_layers}"
+                    )
+                except Exception as e:
+                    print(f"[yellow]Silhouette guidance failed ({e}) — using default bounds[/]")
 
             # The direction source is run-identity (recorded in reproduction
             # bundles): "median" uses the per-component median of the residual
@@ -838,11 +909,39 @@ class NativeAbliterator:
                 'optimization to "maximize" or "minimize".'
             )
         print(f"* Optuna objectives: {objective_labels}")
+
+        # Staged search setup: split components into attention and MLP groups.
+        all_components = model.get_abliterable_components()
+        attn_components = [c for c in all_components if c.startswith("attn")]
+        mlp_components = [c for c in all_components if c.startswith("mlp")]
+        staged_active = bool(
+            getattr(self.config, "staged_search", False)
+            and attn_components
+            and mlp_components
+        )
+        stage1_n = round(self.config.n_trials * float(getattr(self.config, "staged_stage1_fraction", 0.4) or 0.4))
+        stage1_n = max(3, min(stage1_n, self.config.n_trials - 3))
+        staged_attn_best: Optional[dict[str, "AbliterationParameters"]] = None
+        if getattr(self.config, "staged_search", False) and not staged_active:
+            print(
+                "[yellow]Staged search requested but the model does not expose both attention "
+                "and MLP components — running the standard search.[/]"
+            )
+        elif staged_active:
+            print(
+                f"* Staged search active: stage 1 = attention-only (trials 1-{stage1_n}), "
+                f"stage 2 = MLP on top of the frozen attention winner (trials {stage1_n + 1}-{self.config.n_trials})"
+            )
+
         study = optuna.create_study(
             sampler=TPESampler(
                 n_startup_trials=self.config.n_startup_trials,
                 n_ei_candidates=128,
                 multivariate=True,
+                # Group decomposition: a no-op for the static space, but required
+                # for the staged search where stage-1 trials sample attention
+                # params and stage-2 trials sample MLP params.
+                group=True,
                 seed=self.config.seed,
             ),
             directions=study_directions,
@@ -914,7 +1013,7 @@ class NativeAbliterator:
 
         # Objective — scorers provide the scores; capability proxy may add one more
         def objective(trial: Trial) -> tuple[float, ...]:
-            nonlocal trial_index, last_trial_end
+            nonlocal trial_index, last_trial_end, staged_attn_best
             trial_index += 1
             trial.set_user_attr("index", trial_index)
 
@@ -924,8 +1023,51 @@ class NativeAbliterator:
             if direction_scope == "per layer":
                 direction_index = None
 
+            # Staged search: stage 1 samples attention components only (MLP
+            # frozen at identity); stage 2 freezes the stage-1 attention winner
+            # (with a +/-20% max_weight rescale) and samples the MLP components.
+            stage = 1
+            attn_rescale = 1.0
+            if staged_active:
+                stage = 2 if trial_index > stage1_n else 1
+                trial.set_user_attr("stage", "attn" if stage == 1 else "mlp")
+                if stage == 2 and staged_attn_best is None:
+                    staged_attn_best = _stage_best_params(
+                        study, "attn", [c for c in all_components if c.startswith("attn")]
+                    )
+                    if staged_attn_best is None:
+                        print(
+                            "[yellow]Stage 1 produced no completed attention trials — "
+                            "falling back to the standard full search.[/]"
+                        )
+                if stage == 2 and staged_attn_best is not None:
+                    attn_rescale = trial.suggest_float("attn.max_weight_rescale", 0.8, 1.2)
+                    trial.set_user_attr("attn_rescale", attn_rescale)
+
             parameters: dict[str, AbliterationParameters] = {}
             for component in model.get_abliterable_components():
+                # Staged search overrides per component:
+                # - stage 1: MLP components are frozen at identity (no ablation),
+                #   so stage 1 is a pure attention-only search;
+                # - stage 2: attention components are frozen at the stage-1 winner
+                #   (with a +/-20% max_weight rescale), MLP is sampled freely.
+                if staged_active and stage == 1 and component.startswith("mlp"):
+                    parameters[component] = AbliterationParameters(
+                        max_weight=0.0,
+                        max_weight_position=0.6 * last_layer_index,
+                        min_weight=0.0,
+                        min_weight_distance=1.0,
+                    )
+                    continue
+                if staged_active and stage == 2 and component.startswith("attn") and staged_attn_best and component in staged_attn_best:
+                    base = staged_attn_best[component]
+                    parameters[component] = AbliterationParameters(
+                        max_weight=base.max_weight * attn_rescale,
+                        max_weight_position=base.max_weight_position,
+                        min_weight=base.min_weight * attn_rescale,
+                        min_weight_distance=base.min_weight_distance,
+                    )
+                    continue
                 # The parameter ranges are based on experiments with various models
                 # and much wider ranges. They are not set in stone and might have to
                 # be adjusted for future models.
@@ -946,7 +1088,10 @@ class NativeAbliterator:
                     0.0,
                     trial.suggest_float(f"{component}.max_weight", max_weight_lower_bound, max_weight_upper),
                 )
-                max_weight_position = trial.suggest_float(f"{component}.max_weight_position", 0.6 * last_layer_index, 1.0 * last_layer_index)
+                pos_low = 0.6 * last_layer_index
+                if getattr(self, "_silhouette_position_low", None) is not None:
+                    pos_low = min(max(1.0, self._silhouette_position_low), last_layer_index)
+                max_weight_position = trial.suggest_float(f"{component}.max_weight_position", pos_low, 1.0 * last_layer_index)
                 min_weight = trial.suggest_float(f"{component}.min_weight", 0.0, 1.0)
                 min_weight_distance = trial.suggest_float(
                     f"{component}.min_weight_distance",
@@ -973,6 +1118,7 @@ class NativeAbliterator:
             print("* Abliterating...")
             model.abliterate(refusal_directions, direction_index, parameters)
             print("* Evaluating...")
+            evaluator.clear_response_caches()
 
             # Multi-fidelity early abandonment: a trial that is already
             # provably dominated by some completed trial never reaches the

@@ -24,7 +24,7 @@ if requirements_file.exists():
 
 setup(
     name="AnlordAbliterator",
-    version="1.3.0",
+    version="1.4.0",
     description="Anlord Abliterator — automated LLM abliteration and evaluation",
     long_description=long_description,
     long_description_content_type="text/markdown",
