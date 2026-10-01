@@ -116,6 +116,11 @@ class NativeConfig:
     # model
     model: str = "HuggingFaceTB/SmolLM2-135M"
     model_commit: Optional[str] = None
+    # Separate tokenizer source (path or repo id) for models whose tokenizer
+    # lives outside the model folder — e.g. the `tokenizer/` subfolder of a
+    # diffusers pipeline when abliterating its `text_encoder/`. None = the
+    # model path itself.
+    tokenizer_source: Optional[str] = None
     dtypes: List[str] = field(default_factory=lambda: ["auto", "float16", "bfloat16", "float32"])
     quantization: QuantizationMethod = QuantizationMethod.NONE
     device_map: str | Dict[str, int | str] = "auto"
@@ -178,6 +183,10 @@ class NativeConfig:
     # Enqueue a few sensible starting configurations when a study is fresh, so
     # the Pareto front forms immediately instead of after random exploration.
     search_seeds: bool = True
+    # After the trials, interactively pick the export trial from the top N
+    # completed trials (ranked by refusals, then KL). 0 = automatic pick
+    # (first sorted Pareto trial).
+    trial_selection_topn: int = 0
 
     # debug / reproducibility metadata
     print_debug_information: bool = False
@@ -455,6 +464,9 @@ class NativeConfig:
             direction_source=direction_source,
             evaluation_pruning=bool(getattr(settings, "abliteration_pruning", True)),
             search_seeds=bool(getattr(settings, "search_seeds", True)),
+            trial_selection_topn=int(
+                getattr(settings, "abliteration_trial_select_top", 0) or 0
+            ),
             print_debug_information=bool(getattr(settings, "print_debug_information", False)),
             reproducibility_information=raw_repro_info,
             ignore_mismatches=getattr(settings, "ignore_mismatches", None),

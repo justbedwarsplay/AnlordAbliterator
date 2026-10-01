@@ -76,9 +76,19 @@ class AbliterationResult:
             return False
         has_config = (path / "config.json").is_file()
         has_adapter_config = (path / "adapter_config.json").is_file()
+        # Diffusers pipelines carry a model_index.json instead of a config.json,
+        # and keep their weights in component subfolders (transformer/, vae/, ...).
+        has_diffusers = (path / "model_index.json").is_file()
         weight_patterns = ("*.safetensors", "*.bin", "*.pt", "*.pth")
         has_weights = any(any(path.glob(pattern)) for pattern in weight_patterns)
-        return has_weights and (has_config or has_adapter_config)
+        if not has_weights and has_diffusers:
+            has_weights = any(
+                any(subdirectory.glob(pattern))
+                for subdirectory in path.iterdir()
+                if subdirectory.is_dir()
+                for pattern in weight_patterns
+            )
+        return has_weights and (has_config or has_adapter_config or has_diffusers)
 
 
 @dataclass

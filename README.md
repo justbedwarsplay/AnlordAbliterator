@@ -44,6 +44,9 @@
 | **⚡ Search acceleration** | Multi-fidelity pruning of dominated trials (cheap KL first, refusal prefixes next), seed trials for fresh studies, 20 startup trials, 64-token refusal counting — a 200-trial run fits in ~1.5 h on an 8 GB GPU |
 | **🎭 Staged search** *(experimental)* | Stage 1 optimizes attention only, stage 2 optimizes MLP on top of the frozen attention winner (±20% rescale). Underperformed the joint search on Qwen3.5-0.8B — off by default |
 | **🎯 Silhouette-guided bounds** | The max_weight_position range is lower-bounded by the first residual layer with meaningful good/bad cluster separation — no wasted trials in dead zones |
+| **🏗️ Architecture profiles** | Known model families get tuned search defaults automatically: Gemma raises the max_weight ceiling to 2.0 (its ablation is MLP-carried — measured on gemma-3-270m, where the Qwen-tuned 1.5 ceiling stalled a 500-trial search at 36/100 refusals). Qwen keeps the base; unknown architectures keep the base. Explicit flags always win; a warning prints when the export trial sits at the ceiling |
+| **🗳️ Manual trial selection** | `--select-trial-top N` — after the trials, interactively pick the export trial from the top N completed trials (ranked by refusals, then KL); dominated low-KL trials are often the better export |
+| **🖼️ Image-model abliteration** | `--image-model` (auto-detected) — abliterate the **text encoder** of a diffusers text-to-image pipeline (Qwen-Image lineage): the encoder is an aligned instruct LLM, so the standard refusal-direction machinery applies while the DiT and VAE stay untouched; the export is a complete ready-to-use pipeline folder |
 | **🧪 Behavioral reproduction check** | `--reproduce` re-measures refusals and KL on the reproduced model and prints MATCH/MISMATCH against the original run |
 | **💻 Hardware-aware** | `psutil` + `pynvml` monitoring. `HardwarePlanner` auto-selects load-time `quantization` / `device_map` / `max_memory` / `batch_size` for your GPU (see note below) |
 | **📝 Reports** | Interactive `report.html` + `report.json` + `report.csv` + per-benchmark `*.json` |
@@ -201,6 +204,8 @@ Choose via `--tasks` or the interactive checkbox:
 Model:
   --model, -m            HF ID or local path
   --model-commit         pin a commit hash
+  --image-model / --no-image-model  target is a diffusers T2I pipeline: ablate its text encoder
+                                 (default: auto-detect via model_index.json)
   --output, -o           output root (contains results/reports/models/cache)
   --cache-dir            HF cache dir (default ./cache)
   --prefetch-model / --no-prefetch-model
@@ -236,10 +241,16 @@ Export / reproduction:
 Search acceleration:
   --startup-trials       random-sampling TPE startup (default: automatic, ~min(20, n/8))
   --max-response-length  refusal-counting generation cap (default 64)
-  --max-weight-limit     max_weight ceiling (default 1.5; raise to 2.0+ for attention-only)
+  --max-weight-limit     max_weight ceiling (default: automatic — architecture profiles set a
+                         family-specific value, e.g. 2.0 for Gemma; base 1.5)
   --direction-source     mean | median (robust to massive activations)
   --pruning / --no-pruning       early abandonment of dominated trials (default on)
   --search-seeds / --no-search-seeds   seed configs for fresh studies (default on)
+
+Trial selection (1.5.0):
+  --select-trial-top N   interactively pick the export trial from the top N completed trials
+                         (ranked by refusals, then KL). 0 = automatic (best Pareto trial);
+                         non-interactive sessions fall back to automatic
 
 Search acceleration (1.4.0):
   --startup-trials       random-sampling TPE startup (default: automatic, ~min(20, n/8))
@@ -370,6 +381,31 @@ Built-in plugins live under the `anlord.scorers.*` namespace; external ones are 
 without running the full task on every trial. Only runs whose model and
 datasets are pinned Hugging Face paths and whose scorers are all reproducible built-ins get a
 reproduction bundle.
+
+## Image models (text-to-image)
+
+`--image-model` (auto-detected for diffusers repositories) abliterates the
+**text encoder** of a text-to-image pipeline instead of a standalone LLM.
+Modern T2I encoders (Qwen-Image lineage, Z-Image, ...) are aligned instruct
+models, so the standard refusal-direction machinery applies to them directly,
+while the transformer (DiT) and VAE are copied through untouched. The export is
+a complete, ready-to-use diffusers folder with the ablated encoder inside
+(`model_index.json`, `transformer/`, `vae/`, `text_encoder/`, ...).
+
+Notes:
+- the whole pipeline snapshot is downloaded — the export needs every component;
+- the image branch uses its own T2I-style prompt sets — 100 harmless + 100 harmful
+  descriptive image prompts in `src/anlord/image/prompts/` (one per line), instead of
+  the LLM-style request phrasing of the default text-model datasets; drop-in replaceable;
+- during trials the encoder is scored as a language model (refusal keywords on
+  its own text outputs + KL drift on harmless prompts); no image generation is
+  performed;
+- benchmarks are skipped automatically (they do not apply to T2I pipelines);
+- architecture profiles resolve from the encoder's own config.
+
+```bash
+python -m src.anlord --model Qwen/Qwen-Image-2.1 --image-model --trials 100 --skip-benchmarks
+```
 
 ## GGUF Quantization
 

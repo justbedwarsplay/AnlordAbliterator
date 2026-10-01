@@ -71,6 +71,13 @@ Examples:
     model_group.add_argument("--output", "-o", type=str, default=None, help="Output directory")
     model_group.add_argument("--cache-dir", type=str, default=None, help="Cache directory")
     model_group.add_argument(
+        "--image-model",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Treat --model as a diffusers text-to-image pipeline: abliterate its text "
+        "encoder (auto-detected for diffusers repos; default: auto)",
+    )
+    model_group.add_argument(
         "--prefetch-model",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -165,9 +172,10 @@ Examples:
     search_group.add_argument(
         "--max-weight-limit",
         type=float,
-        default=1.5,
+        default=None,
         help="Upper bound of the max_weight search range; raise to 2.0+ for attention-only "
-        "runs so attention alone can carry the ablation (default: 1.5)",
+        "runs so attention alone can carry the ablation (default: automatic — architecture "
+        "profiles set a family-specific value, e.g. 2.0 for Gemma; base 1.5)",
     )
     search_group.add_argument(
         "--direction-source",
@@ -209,6 +217,13 @@ Examples:
         default=False,
         help="Lower-bound the max_weight_position search range by the first residual layer "
         "with meaningful good/bad cluster separation (silhouette-based, experimental)",
+    )
+    search_group.add_argument(
+        "--select-trial-top",
+        type=int,
+        default=0,
+        help="After the trials, interactively pick the export trial from the top N completed "
+        "trials (ranked by refusals, then KL). 0 = automatic (best Pareto trial)",
     )
 
     # Residual analysis
@@ -443,6 +458,7 @@ def run_from_args(args: argparse.Namespace) -> Settings:
     settings = Settings(
         model=args.model or "unsloth/gpt-oss-20b-BF16",
         model_commit=args.model_commit,
+        image_model=getattr(args, "image_model", None),
         output_dir=Path(args.output) if args.output else Path("./output"),
         cache_dir=Path(args.cache_dir) if args.cache_dir else Path("./cache"),
         prefetch_model=args.prefetch_model,
@@ -458,7 +474,8 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         abliteration_components=components,
         abliteration_startup_trials=getattr(args, "startup_trials", None),
         abliteration_max_response_length=getattr(args, "max_response_length", 64),
-        abliteration_max_weight_limit=getattr(args, "max_weight_limit", 1.5),
+        abliteration_max_weight_limit=getattr(args, "max_weight_limit", None),
+        abliteration_trial_select_top=getattr(args, "select_trial_top", 0) or 0,
         abliteration_direction_source=getattr(args, "direction_source", "mean"),
         abliteration_pruning=getattr(args, "pruning", True),
         search_seeds=getattr(args, "search_seeds", True),

@@ -95,6 +95,9 @@ class Settings:
     # Model Configuration
     model: str = "unsloth/gpt-oss-20b-BF16"
     model_commit: Optional[str] = None
+    # Treat --model as a diffusers text-to-image pipeline and abliterate its
+    # text encoder. None = auto-detect (diffusers repos carry model_index.json).
+    image_model: Optional[bool] = None
     output_dir: Path = field(default_factory=lambda: Path("./output"))
     cache_dir: Path = field(default_factory=lambda: Path("./cache"))
     prefetch_model: bool = True
@@ -125,7 +128,10 @@ class Settings:
     abliteration_max_response_length: int = 64
     # Upper bound of the max_weight search range (raise to 2.0+ for
     # attention-only runs so attention alone can carry the ablation).
-    abliteration_max_weight_limit: float = 1.5
+    # None = automatic: architecture profiles may set a family-specific value
+    # (e.g. 2.0 for Gemma, whose ablation is MLP-carried), falling back to the
+    # Qwen-tuned base of 1.5 for unknown architectures.
+    abliteration_max_weight_limit: Optional[float] = None
     # Refusal direction source: "mean" or "median" (per-component median of the
     # residual vectors, robust to massive activations). Recorded in bundles.
     abliteration_direction_source: str = "mean"
@@ -133,6 +139,10 @@ class Settings:
     abliteration_pruning: bool = True
     # Enqueue sensible starting configurations when a study is fresh.
     search_seeds: bool = True
+    # After the trials, interactively pick the export trial from the top N
+    # completed trials (ranked by refusals, then KL divergence).
+    # 0 = automatic (best Pareto trial).
+    abliteration_trial_select_top: int = 0
 
     # Staged search (1.4.0): stage 1 optimizes attention only, stage 2
     # optimizes MLP on top of the frozen stage-1 attention winner.
@@ -278,11 +288,15 @@ class Settings:
             raise ValueError(
                 f"Unsupported abliteration_direction_source: {self.abliteration_direction_source}"
             )
-        if self.abliteration_max_weight_limit <= 0.85:
+        if self.abliteration_max_weight_limit is not None and (
+            self.abliteration_max_weight_limit <= 0.85
+        ):
             raise ValueError(
                 "abliteration_max_weight_limit must be above 0.85 (the attention max_weight "
                 "search lower bound is 0.8)"
             )
+        if self.abliteration_trial_select_top < 0:
+            raise ValueError("abliteration_trial_select_top cannot be negative")
         if self.row_normalization not in {"none", "pre", "full"}:
             raise ValueError(f"Unsupported row_normalization: {self.row_normalization}")
         if self.dtype not in {"auto", "float16", "bfloat16", "float32"}:

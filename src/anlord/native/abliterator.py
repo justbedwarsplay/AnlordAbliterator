@@ -807,6 +807,151 @@ class NativeAbliterator:
             return ExportStrategy.ADAPTER
         return strategy
 
+    def _select_trial(
+        self,
+        best_trials: list,
+        completed: list,
+        ask=None,
+    ):
+        """
+        Picks the trial to export.
+
+        Automatic mode (trial_selection_topn == 0): the first sorted Pareto
+        trial (fewest refusals, then lowest KL). Manual mode (topn > 0): the
+        top `topn` completed trials are ranked by refusals, then KL, displayed
+        and offered for an interactive choice — dominated trials with a much
+        better KL are often the more useful export. Falls back to the
+        automatic pick when there is nothing to choose between, no refusal
+        metrics, or no interactive input is available.
+
+        `ask(choices, default_rank)` returns the chosen 1-based rank or None;
+        it is injectable for tests (default: questionary, then input()).
+        """
+        auto = best_trials[0]
+        topn = int(getattr(self.config, "trial_selection_topn", 0) or 0)
+        if topn <= 0:
+            return auto
+
+        candidates = []
+        for trial in completed:
+            refusals = trial.user_attrs.get("refusals")
+            if refusals is None:
+                continue
+            kl = trial.user_attrs.get("kl_divergence")
+            candidates.append(
+                (
+                    int(refusals),
+                    float(kl) if kl is not None else float("inf"),
+                    int(trial.user_attrs.get("index") or 0),
+                    trial,
+                )
+            )
+        if len(candidates) < 2:
+            print(
+                "[yellow]Trial selection: fewer than two trials with refusal "
+                "metrics — using the automatic Pareto pick.[/]"
+            )
+            return auto
+        candidates.sort(key=lambda item: item[:3])
+        candidates = candidates[:topn]
+
+        pareto_numbers = {trial.number for trial in best_trials}
+        print()
+        print(
+            f"[bold]Trial selection[/]: top {len(candidates)} of "
+            f"{len(completed)} completed trials (ranked by refusals, then KL):"
+        )
+        choices: list[str] = []
+        default_rank = None
+        for rank, (refusals, kl, index, trial) in enumerate(candidates, start=1):
+            total = trial.user_attrs.get("n_bad_prompts")
+            refusals_str = f"{refusals}/{total}" if total else str(refusals)
+            kl_str = f"{kl:.4f}" if math.isfinite(kl) else "n/a"
+            markers = ""
+            if trial.number in pareto_numbers:
+                markers += " [Pareto]"
+            if trial.number == auto.number and default_rank is None:
+                markers += " [auto]"
+                default_rank = rank
+            line = f"{rank}) trial {index} — refusals {refusals_str}, KL {kl_str}{markers}"
+            print(f"  * {line}")
+            choices.append(line)
+        if default_rank is None:
+            default_rank = 1
+
+        picked = self._ask_trial_choice(choices, default_rank, ask=ask)
+        if picked is None:
+            print(
+                "[yellow]Trial selection: no choice available — using the "
+                "automatic Pareto pick.[/]"
+            )
+            return auto
+        refusals, kl, index, chosen = candidates[picked - 1]
+        print(
+            f"* Exporting trial [bold]{index}[/] "
+            f"(rank {picked}: refusals {refusals}, KL {kl:.4f})"
+        )
+        return chosen
+
+    def _ask_trial_choice(self, choices: list[str], default_rank: int, ask=None):
+        """Interactive choice among the rendered trial lines; 1-based rank or
+        None when no answer can be read (non-interactive session, invalid
+        input, cancelled prompt)."""
+        if ask is not None:
+            return ask(choices, default_rank)
+        try:
+            import questionary
+
+            answer = questionary.select(
+                "Export which trial? (Esc/Ctrl-C = automatic pick)",
+                choices=choices,
+            ).ask()
+            if answer in choices:
+                return choices.index(answer) + 1
+            return None
+        except Exception:
+            try:
+                raw = input(
+                    f"Export which trial? [1-{len(choices)}, default {default_rank}]: "
+                )
+                rank = int(raw.strip() or default_rank)
+                return rank if 1 <= rank <= len(choices) else None
+            except Exception:
+                return None
+
+    def _warn_bound_saturation(self, chosen, best_trials: list) -> None:
+        """
+        Warns when the export (or Pareto) parameters sit at the max_weight
+        search ceiling: the space could not explore heavier ablation, so
+        raising --max-weight-limit may improve the result (measured on
+        gemma-3-270m: the 1.5 ceiling was the binding constraint of a
+        500-trial search). Unknown architectures get the same diagnosis for
+        free instead of an unbounded search that wastes trials on garbage.
+        """
+        limit = float(getattr(self.config, "max_weight_limit", 0) or 0)
+        if limit <= 0:
+            return
+        epsilon = 0.02
+
+        def ceiling_components(trial) -> list[str]:
+            params = trial.user_attrs.get("parameters") or {}
+            return [
+                component
+                for component, values in params.items()
+                if abs(float(values.get("max_weight", 0.0)) - limit) <= epsilon
+            ]
+
+        chosen_components = ceiling_components(chosen)
+        if not chosen_components:
+            return
+        front_hits = sum(1 for trial in best_trials if ceiling_components(trial))
+        print(
+            f"[yellow]Warning: {' and '.join(chosen_components)}.max_weight is at the "
+            f"search ceiling ({limit}) — the search could not explore heavier "
+            f"ablation ({front_hits}/{len(best_trials)} Pareto trials hit the "
+            f"ceiling). Consider raising --max-weight-limit.[/]"
+        )
+
     def run(
         self,
         output_dir: Path | str,
@@ -1261,8 +1406,10 @@ class NativeAbliterator:
         )
         print(f"* Pareto front: {len(best_trials)}/{len(completed)} trials")
 
-        # Automatic selection: choose the first Pareto trial (best objective values).
-        chosen = best_trials[0]
+        # Trial selection: automatic (first sorted Pareto trial), or — with
+        # --select-trial-top — interactively from the top-N completed trials.
+        chosen = self._select_trial(best_trials, completed)
+        self._warn_bound_saturation(chosen, best_trials)
         print()
         print("[bold green]Optimization finished![/]")
         cap_str = f" cap {chosen.user_attrs.get('capability', 0):.3f}" if "capability" in chosen.user_attrs else ""

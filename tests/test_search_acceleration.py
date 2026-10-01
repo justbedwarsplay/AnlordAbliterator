@@ -63,7 +63,8 @@ def test_settings_defaults_and_validation():
     settings = Settings()
     assert settings.abliteration_startup_trials is None
     assert settings.abliteration_max_response_length == 64
-    assert settings.abliteration_max_weight_limit == 1.5
+    # 1.5.0: None = automatic (architecture profile or the 1.5 base).
+    assert settings.abliteration_max_weight_limit is None
     assert settings.abliteration_direction_source == "mean"
     assert settings.abliteration_pruning is True
     assert settings.search_seeds is True

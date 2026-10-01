@@ -85,8 +85,9 @@ class Model:
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
 
+        tokenizer_source = getattr(settings, "tokenizer_source", None) or settings.model
         self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.model,
+            tokenizer_source,
             **self.revision_kwargs,
         )
 
@@ -94,7 +95,7 @@ class Model:
         self.processor = None
         if get_model_class(settings.model) == AutoModelForImageTextToText:
             self.processor = AutoProcessor.from_pretrained(
-                settings.model,
+                tokenizer_source,
                 **self.revision_kwargs,
             )
 

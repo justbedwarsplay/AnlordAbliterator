@@ -1,6 +1,6 @@
 [project]
 name = "AnlordAbliterator"
-version = "1.4.0"
+version = "1.5.0"
 description = "Anlord Abliterator — automated LLM abliteration and evaluation"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
@@ -78,6 +78,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"anlord.image" = ["prompts/*.txt"]
 
 [tool.ruff]
 line-length = 100

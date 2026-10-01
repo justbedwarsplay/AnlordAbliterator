@@ -27,12 +27,24 @@ from .models.compatibility import estimate_vram_requirements, check_delta_fast_p
 
 try:
     from .native.abliterator import NativeAbliterator
-    from .native.config import NativeConfig, RowNormalization as NativeRowNorm
+    from .native.config import (
+        DatasetSpecification,
+        NativeConfig,
+        RowNormalization as NativeRowNorm,
+    )
 except Exception:  # pragma: no cover
     NativeAbliterator = None  # type: ignore
     NativeConfig = None  # type: ignore
     NativeRowNorm = None  # type: ignore
+from .image import (
+    assemble_pipeline_output,
+    bundled_t2i_prompts,
+    is_diffusers_repo,
+    prefetch_image_repo,
+    resolve_local_repo,
+)
 from .models import prefetch_model_snapshot
+from .profiles import apply_architecture_profile, detect_model_type
 from .models.downloader import build_snapshot_plan, find_local_snapshot, list_remote_model_files
 from .reports import ReportGenerator
 from .utils.runtime import configure_huggingface_environment, free_torch_memory
@@ -107,6 +119,9 @@ class AbliterationPipeline:
         # keep legacy fresh dir for compatibility but use stable one for Abliteration
         self._fresh_checkpoint_dir = self._study_checkpoint_dir
         self._delta_status: dict = {}
+        # Resolved in run(): True when --model is a diffusers text-to-image
+        # pipeline (text-encoder abliteration branch).
+        self._image_target: bool = False
         logger.info("Pipeline initialized for model: %s", settings.model)
         logger.info("Benchmark mode: %s", "native (original)" if getattr(settings, "native_benchmarks", True) else "lm-eval")
 
@@ -151,6 +166,27 @@ class AbliterationPipeline:
         temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
         temporary.replace(path)
 
+    def _resolve_image_target(self) -> bool:
+        """Whether --model is a diffusers text-to-image pipeline.
+
+        Explicit --image-model / --no-image-model wins; otherwise the target
+        is auto-detected by the model_index.json marker (local path, cached
+        snapshot, or HF repo)."""
+        if self.settings.image_model is not None:
+            if self.settings.image_model:
+                logger.info("Image mode enabled explicitly (--image-model)")
+            return bool(self.settings.image_model)
+        target = is_diffusers_repo(
+            self.settings.model,
+            self.settings.cache_dir,
+            self.settings.model_commit,
+        )
+        if target:
+            logger.info(
+                "Image mode auto-detected: %s is a diffusers pipeline", self.settings.model
+            )
+        return target
+
     def _check_hardware(self) -> None:
         logger.info("Checking hardware capabilities...")
         info = get_system_info()
@@ -158,7 +194,13 @@ class AbliterationPipeline:
             logger.warning("CUDA is not available; falling back to CPU")
             self.settings.device = "cpu"
 
-        estimated_vram = estimate_vram_requirements(self.settings.model, dtype=self.settings.dtype)
+        try:
+            estimated_vram = estimate_vram_requirements(
+                self.settings.model, dtype=self.settings.dtype
+            )
+        except Exception as error:
+            logger.debug("Could not estimate VRAM requirements: %s", error)
+            estimated_vram = 0.0
         if info.has_cuda and estimated_vram > 0 and estimated_vram > info.total_vram_gb:
             logger.warning(
                 "Model may exceed available VRAM (estimated %.1f GB, available %.1f GB)",
@@ -284,6 +326,39 @@ class AbliterationPipeline:
         return None
 
 
+    def _apply_architecture_profile(self) -> None:
+        """Architecture profiles: known model families get family-specific
+        defaults for the abliteration search (e.g. a higher max_weight ceiling
+        for Gemma, whose ablation is MLP-carried). Explicit user values always
+        win; unregistered architectures keep the base defaults. Skipped in
+        reproduction mode — the bundle carries the original run's values."""
+        model_type = detect_model_type(
+            self.settings.model,
+            self.settings.cache_dir,
+            self.settings.model_commit,
+        )
+        profile = apply_architecture_profile(self.settings, model_type)
+        if profile is None:
+            if model_type:
+                logger.debug(
+                    "No architecture profile for model_type %s — base defaults",
+                    model_type,
+                )
+            return
+        if profile.overrides:
+            resolved = ", ".join(
+                f"{name}={getattr(self.settings, name)}"
+                for name in profile.overrides
+            )
+        else:
+            resolved = "base defaults (no overrides)"
+        logger.info(
+            "Architecture profile '%s' (model_type %s): %s",
+            profile.label,
+            model_type,
+            resolved,
+        )
+
     def _check_model_compatibility(self) -> None:
         logger.info("Checking model compatibility...")
         # Use model compatibility checker directly (no wrapper)
@@ -386,6 +461,16 @@ class AbliterationPipeline:
         logger.info("\n%s", "=" * 60)
         logger.info("MODEL DOWNLOAD: Hugging Face snapshot")
         logger.info("%s", "=" * 60)
+        if getattr(self, "_image_target", False):
+            # Full snapshot: the export must be a complete pipeline folder
+            # (transformer, VAE, scheduler, tokenizer), so no pattern filtering.
+            source = prefetch_image_repo(
+                self.settings.model,
+                self.settings.cache_dir,
+                self.settings.model_commit,
+            )
+            logger.info("Diffusers snapshot ready: %s", source)
+            return
         prefetch_model_snapshot(
             self.settings.model,
             cache_dir=self.settings.cache_dir,
@@ -443,9 +528,22 @@ class AbliterationPipeline:
         metrics: HardwareMetrics | None = None
 
         try:
+            self._image_target = self._resolve_image_target()
+            if self._image_target and not self.settings.skip_benchmarks:
+                logger.warning(
+                    "Image mode: benchmarks do not apply to diffusers pipelines - skipping"
+                )
+                self.settings.skip_benchmarks = True
             self._check_hardware()
+            self._apply_architecture_profile()
             self._save_run_config()
-            self._check_model_compatibility()
+            if self._image_target:
+                logger.info(
+                    "Image mode: architecture compatibility check skipped "
+                    "(the text encoder is validated at load time)"
+                )
+            else:
+                self._check_model_compatibility()
             self._prefetch_model()
             if self.settings.resume:
                 status = self._check_resume_status()
@@ -993,6 +1091,9 @@ class AbliterationPipeline:
                 "--skip-abliteration was specified, but no valid abliterated model exists"
             )
 
+        if self._image_target:
+            return self._run_image_abliteration()
+
         logger.info("Freeing leftover CUDA tensors before abliteration")
         free_torch_memory()
         # Ensure study checkpoint dir exists
@@ -1008,18 +1109,7 @@ class AbliterationPipeline:
             try:
                 logger.info("Using native abliterator (no abliteration subprocess)")
                 native_cfg = NativeConfig.from_anlord_settings(self.settings)  # type: ignore
-                # propagate row_norm / orthogonalize / winsorization overrides from Settings
-                try:
-                    # map string to enum
-                    if getattr(self.settings, "row_normalization", None):
-                        native_cfg.row_normalization = NativeRowNorm(getattr(self.settings, "row_normalization"))  # type: ignore
-                    native_cfg.orthogonalize_direction = bool(getattr(self.settings, "orthogonalize_direction", True))
-                    native_cfg.winsorization_quantile = float(getattr(self.settings, "winsorization_quantile", 1.0))
-                    native_cfg.kl_divergence_scale = float(getattr(self.settings, "kl_divergence_scale", 1.0))
-                    native_cfg.kl_divergence_target = float(getattr(self.settings, "kl_divergence_target", 0.01))
-                    native_cfg.full_normalization_lora_rank = int(getattr(self.settings, "full_normalization_lora_rank", 3))
-                except Exception as e:
-                    logger.debug("Native config override failed: %s", e)
+                self._apply_native_overrides(native_cfg)
                 abliter = NativeAbliterator(native_cfg, anlord_settings=self.settings)  # type: ignore
                 # output dir: models/abliteration_output equivalent but native
                 native_out = self.settings.get_models_dir() / "abliterated"
@@ -1061,6 +1151,124 @@ class AbliterationPipeline:
                 raise RuntimeError(f"Native abliteration failed: {native_err}") from native_err
 
         raise RuntimeError("Native abliteration is unavailable and no fallback is configured")
+
+    def _apply_native_overrides(self, native_cfg) -> None:
+        """Propagate row_norm / orthogonalize / winsorization overrides from Settings."""
+        try:
+            # map string to enum
+            if getattr(self.settings, "row_normalization", None):
+                native_cfg.row_normalization = NativeRowNorm(getattr(self.settings, "row_normalization"))  # type: ignore
+            native_cfg.orthogonalize_direction = bool(getattr(self.settings, "orthogonalize_direction", True))
+            native_cfg.winsorization_quantile = float(getattr(self.settings, "winsorization_quantile", 1.0))
+            native_cfg.kl_divergence_scale = float(getattr(self.settings, "kl_divergence_scale", 1.0))
+            native_cfg.kl_divergence_target = float(getattr(self.settings, "kl_divergence_target", 0.01))
+            native_cfg.full_normalization_lora_rank = int(getattr(self.settings, "full_normalization_lora_rank", 3))
+        except Exception as e:
+            logger.debug("Native config override failed: %s", e)
+
+    def _run_image_abliteration(self) -> None:
+        """Image mode: abliterate the pipeline's text encoder with the native
+        engine, then re-assemble a complete diffusers folder around it.
+
+        The refusal-direction machinery runs on the encoder as a regular causal
+        LM (modern T2I encoders are aligned instruct models); the transformer
+        (DiT) and VAE are copied through untouched. See anlord/image/diffusers.py.
+        """
+        if NativeAbliterator is None or NativeConfig is None:  # type: ignore
+            raise RuntimeError("Native abliteration backend is unavailable")
+
+        logger.info("Image mode: abliterating the text encoder of %s", self.settings.model)
+        source = resolve_local_repo(
+            self.settings.model, self.settings.cache_dir, self.settings.model_commit
+        )
+        if source is None:
+            source = Path(
+                prefetch_image_repo(
+                    self.settings.model,
+                    self.settings.cache_dir,
+                    self.settings.model_commit,
+                )
+            )
+        encoder_dir = source / "text_encoder"
+        tokenizer_dir = source / "tokenizer"
+        if not (encoder_dir / "config.json").is_file():
+            raise RuntimeError(f"Diffusers repo has no text_encoder/config.json: {source}")
+        if not tokenizer_dir.is_dir():
+            raise RuntimeError(f"Diffusers repo has no tokenizer folder: {source}")
+
+        # Profiles resolve from the encoder's own config (the pipeline root has
+        # no transformers config, so run()-level detection cannot see it).
+        apply_architecture_profile(self.settings, detect_model_type(str(encoder_dir)))
+
+        logger.info("Freeing leftover CUDA tensors before abliteration")
+        free_torch_memory()
+        native_cfg = NativeConfig.from_anlord_settings(self.settings)  # type: ignore
+        self._apply_native_overrides(native_cfg)
+        # Abliterate the encoder component, reading the tokenizer from its own
+        # pipeline subfolder.
+        # T2I prompt defaults: image-gen censorship is triggered by descriptive
+        # image prompts (nudity, gore, hate symbols, ...), not by the LLM-style
+        # request phrasing of the default text-model datasets.
+        t2i_harmless, t2i_harmful = bundled_t2i_prompts()
+        native_cfg.good_prompts = DatasetSpecification(dataset=str(t2i_harmless), split="train")
+        native_cfg.bad_prompts = DatasetSpecification(dataset=str(t2i_harmful), split="train")
+        native_cfg.scorer_settings.setdefault("KeywordRate", {})["prompts"] = {
+            "dataset": str(t2i_harmful), "split": "train", "column": "text",
+        }
+        native_cfg.scorer_settings.setdefault("KLDivergence", {})["prompts"] = {
+            "dataset": str(t2i_harmless), "split": "train", "column": "text",
+        }
+        native_cfg.model = str(encoder_dir)
+        native_cfg.tokenizer_source = str(tokenizer_dir)
+
+        pipeline_root = Path(self.settings.get_models_dir()) / "abliterated"
+        encoder_out = pipeline_root / "text_encoder"
+        encoder_out.mkdir(parents=True, exist_ok=True)
+
+        abliter = NativeAbliterator(native_cfg, anlord_settings=self.settings)  # type: ignore
+        native_result = abliter.run(
+            output_dir=encoder_out, timeout=self.settings.abliteration_timeout
+        )
+
+        moved = assemble_pipeline_output(source, pipeline_root)
+        logger.info(
+            "Diffusers assembly complete (components copied, artifacts moved: %s)",
+            ", ".join(moved) or "none",
+        )
+
+        result = AbliterationResult(
+            model_id=self.settings.model,
+            abliterated_model_path=str(pipeline_root),
+            initial_refusals=native_result.initial_refusals,
+            final_refusals=native_result.final_refusals,
+            total_prompts=native_result.total_prompts,
+            initial_refusal_rate=(
+                native_result.initial_refusals / native_result.total_prompts
+                if native_result.total_prompts and native_result.initial_refusals is not None
+                else None
+            ),
+            final_refusal_rate=(
+                native_result.final_refusals / native_result.total_prompts
+                if native_result.total_prompts and native_result.final_refusals is not None
+                else None
+            ),
+            kl_divergence=native_result.kl_divergence,
+            trials=native_result.trials,
+            best_trial=native_result.best_trial,
+            config=native_result.config,
+        )
+        result.config["image_model"] = True
+        result.config["ablated_component"] = "text_encoder"
+
+        self.abliteration_result = result
+        self._write_json(self.settings.get_results_dir() / "abliteration.json", result.to_dict())
+        logger.info(
+            "Image abliteration completed: refusals %s -> %s; KL divergence %s",
+            format_optional(result.initial_refusals),
+            format_optional(result.final_refusals),
+            format_optional(result.kl_divergence, "{:.4f}"),
+        )
+        self._synthesize_baseline_from_abliteration()
 
     def _load_abliteration_result(self) -> AbliterationResult | None:
         path = self.settings.get_results_dir() / "abliteration.json"
