@@ -156,6 +156,17 @@ def _completed_metric_points(study) -> list[tuple[int, float]]:
     return points
 
 
+class MultiFidelityPrunedSignal(Exception):
+    """Raised by multi-fidelity pruning instead of optuna's TrialPruned.
+
+    optuna's TPESampler crashes on pruned trials in multi-objective studies:
+    _get_pruned_trial_score touches the singular study.direction
+    ("A single direction cannot be retrieved from a multi-objective study",
+    observed on 4.9.0). FAIL-state trials are ignored by the sampler on every
+    optuna version, so pruning raises a caught exception instead - the trial
+    ends as FAIL with its partial metrics preserved in storage."""
+
+
 def _pruning_schedule(
     total_prompts: int, batch_size: int, fractions: list[float]
 ) -> list[int]:
@@ -1303,7 +1314,7 @@ class NativeAbliterator:
                                 f"  * [yellow]Pruned after KL step: KL {kl_value:.4f} is above the "
                                 f"zero-refusal front point ({min(zero_refusal_kls):.4f})[/]"
                             )
-                            raise TrialPruned()
+                            raise MultiFidelityPrunedSignal()
                         total = evaluator.refusal_prompt_total()
                         for step_index, k in enumerate(pruning_schedule):
                             r_k = evaluator.quick_refusals(k)
@@ -1334,7 +1345,7 @@ class NativeAbliterator:
                                     f"(refusals {refusals_f}, KL {kl_f:.4f})[/]"
                                 )
                                 trial.set_user_attr("pruned_at", k)
-                                raise TrialPruned()
+                                raise MultiFidelityPrunedSignal()
 
             scores = evaluator.get_scores()
             objective_values = list(evaluator.get_objective_values(scores))
@@ -1400,7 +1411,12 @@ class NativeAbliterator:
         if n_needed > 0:
             # timeout handling
             try:
-                study.optimize(objective_wrapper, n_trials=n_needed, timeout=timeout)
+                study.optimize(
+                    objective_wrapper,
+                    n_trials=n_needed,
+                    timeout=timeout,
+                    catch=(MultiFidelityPrunedSignal,),
+                )
             except KeyboardInterrupt:
                 pass
 
