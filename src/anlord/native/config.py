@@ -174,6 +174,16 @@ class NativeConfig:
     # "mean" (classic) or "median" (per-component median, robust to massive
     # activations). Run-identity: recorded in reproduction bundles.
     direction_source: str = "mean"
+    # Input-side ablation (1.6.0): ablate the paired read-side modules
+    # (attention Q/K/V, MLP gate/up) with the same per-layer weight as the
+    # write-side components. See Settings.abliteration_input_side.
+    abliteration_input_side: bool = False
+    # Weight decay profile across layers: "linear" (classic ramp) or "gaussian".
+    decay_kernel: str = "linear"
+    # "lora" = reversible adapters (merged on export); "direct" = in-place base
+    # weight editing with delta-journal restore between trials. Direct requires
+    # quantization none (bf16/fp16 weights must be writable).
+    steering_mode: str = "lora"
     # Early abandonment of provably dominated trials: evaluate the cheap KL
     # forward first, then refusal counts on batch-aligned prefixes of the
     # evaluation set, and prune as soon as some completed trial is guaranteed
@@ -419,6 +429,14 @@ class NativeConfig:
                 "search lower bound is 0.8)"
             )
 
+        # KL token count: inject into the built-in KL scorer settings unless the
+        # user already configured them explicitly.
+        kl_token_count = getattr(settings, "abliteration_kl_token_count", None)
+        if kl_token_count:
+            kl_table = scorer_settings.get("KLDivergence") or {}
+            kl_table.setdefault("token_count", int(kl_token_count))
+            scorer_settings["KLDivergence"] = kl_table
+
         return cls(
             model=getattr(settings, "model", "HuggingFaceTB/SmolLM2-135M"),
             model_commit=getattr(settings, "model_commit", None),
@@ -462,6 +480,9 @@ class NativeConfig:
             max_response_length=int(getattr(settings, "abliteration_max_response_length", 64) or 64),
             max_weight_limit=max_weight_limit,
             direction_source=direction_source,
+            abliteration_input_side=bool(getattr(settings, "abliteration_input_side", False)),
+            decay_kernel=str(getattr(settings, "abliteration_decay_kernel", "linear") or "linear"),
+            steering_mode=str(getattr(settings, "steering_mode", "lora") or "lora"),
             evaluation_pruning=bool(getattr(settings, "abliteration_pruning", True)),
             search_seeds=bool(getattr(settings, "search_seeds", True)),
             trial_selection_topn=int(

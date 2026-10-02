@@ -199,6 +199,10 @@ class Context:
     def get_logits(self, prompts: list[Prompt]) -> Tensor:
         return self._model.get_logits_batched(prompts)
 
+    def get_logits_multi(self, prompts: list[Prompt], token_count: int = 1) -> Tensor:
+        """Raw logits for the first `token_count` generated tokens: [T, B, V]."""
+        return self._model.get_logits_multi_batched(prompts, token_count)
+
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
         return self._model.get_residuals_batched(prompts)
 

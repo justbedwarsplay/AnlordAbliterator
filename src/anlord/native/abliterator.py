@@ -759,6 +759,26 @@ class NativeAbliterator:
             strategy = ExportStrategy(strategy)
         print(f"* Saving model to [bold]{output_dir}[/] (export strategy: {strategy.value})...")
 
+        if getattr(self.config, "steering_mode", "lora") == "direct":
+            # Direct steering: the weights are already edited in place - no
+            # LoRA merge step exists or is needed.
+            print("* Direct steering: saving the edited base model (no merge needed)...")
+            try:
+                model.model.save_pretrained(
+                    str(output_dir),
+                    safe_serialization=True,
+                    max_shard_size=self.config.max_shard_size,
+                )
+            except TypeError:
+                model.model.save_pretrained(str(output_dir), safe_serialization=True)
+            model.tokenizer.save_pretrained(str(output_dir))
+            if model.processor is not None:
+                try:
+                    model.processor.save_pretrained(str(output_dir))
+                except Exception:
+                    pass
+            return ExportStrategy.MERGE
+
         if strategy == ExportStrategy.ADAPTER:
             print("* Saving LoRA adapter...")
             # Canonicalize dead entries so the adapter file is reproducible.

@@ -135,6 +135,23 @@ class Settings:
     # Refusal direction source: "mean" or "median" (per-component median of the
     # residual vectors, robust to massive activations). Recorded in bundles.
     abliteration_direction_source: str = "mean"
+    # Input-side ablation (1.6.0): additionally ablate the paired read-side
+    # modules (attention Q/K/V, MLP gate/up) with the same per-layer weight as
+    # their write-side counterpart. Removes the direction where modules READ
+    # the residual stream - lower KL at equal refusal reduction.
+    abliteration_input_side: bool = False
+    # Weight decay profile across layers: "linear" (classic ramp) or "gaussian"
+    # (smoother falloff around max_weight_position).
+    abliteration_decay_kernel: str = "linear"
+    # Steering mode (1.6.0): "lora" edits ride in reversible LoRA adapters
+    # (merged on export); "direct" edits the base weights in place and restores
+    # them from a delta journal between trials. Required for architectures whose
+    # input normalization (e.g. Gemma-4 PLE + multiple RMSNorms) cannot be
+    # represented by a rank-1 adapter. Direct requires quantization none.
+    steering_mode: str = "lora"
+    # Average the KL divergence over the first N generated token positions
+    # instead of just the first one. None = 1 (classic first-token KL).
+    abliteration_kl_token_count: Optional[int] = None
     # Early abandonment of provably dominated trials (multi-fidelity evaluation).
     abliteration_pruning: bool = True
     # Enqueue sensible starting configurations when a study is fresh.
@@ -288,6 +305,16 @@ class Settings:
             raise ValueError(
                 f"Unsupported abliteration_direction_source: {self.abliteration_direction_source}"
             )
+        if self.abliteration_decay_kernel not in {"linear", "gaussian"}:
+            raise ValueError(
+                f"Unsupported abliteration_decay_kernel: {self.abliteration_decay_kernel}"
+            )
+        if self.steering_mode not in {"lora", "direct"}:
+            raise ValueError(f"Unsupported steering_mode: {self.steering_mode}")
+        if self.abliteration_kl_token_count is not None and not (
+            1 <= self.abliteration_kl_token_count <= 8
+        ):
+            raise ValueError("abliteration_kl_token_count must be between 1 and 8")
         if self.abliteration_max_weight_limit is not None and (
             self.abliteration_max_weight_limit <= 0.85
         ):

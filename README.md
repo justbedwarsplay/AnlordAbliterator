@@ -47,6 +47,9 @@
 | **🏗️ Architecture profiles** | Known model families get tuned search defaults automatically: Gemma raises the max_weight ceiling to 2.0 (its ablation is MLP-carried — measured on gemma-3-270m, where the Qwen-tuned 1.5 ceiling stalled a 500-trial search at 36/100 refusals). Qwen keeps the base; unknown architectures keep the base. Explicit flags always win; a warning prints when the export trial sits at the ceiling |
 | **🗳️ Manual trial selection** | `--select-trial-top N` — after the trials, interactively pick the export trial from the top N completed trials (ranked by refusals, then KL); dominated low-KL trials are often the better export |
 | **🖼️ Image-model abliteration** | `--image-model` (auto-detected) — abliterate the **text encoder** of a diffusers text-to-image pipeline (Qwen-Image lineage): the encoder is an aligned instruct LLM, so the standard refusal-direction machinery applies while the DiT and VAE stay untouched; the export is a complete ready-to-use pipeline folder |
+| **↔️ Input-side ablation** | `--input-side-ablation` — also ablate the paired read-side modules (attention Q/K/V, MLP gate/up) with the same per-layer weight as their write-side counterpart: removes the direction where modules *read* the residual stream — lower KL at equal refusal reduction |
+| **🌊 Gaussian decay** | `--decay-kernel gaussian` — smoother weight falloff around max_weight_position instead of the classic linear ramp |
+| **🔢 Multi-token KL** | `--kl-token-count N` — average the KL divergence over the first N generated tokens instead of just the first one; less sensitive to single-token noise |
 | **🧪 Behavioral reproduction check** | `--reproduce` re-measures refusals and KL on the reproduced model and prints MATCH/MISMATCH against the original run |
 | **💻 Hardware-aware** | `psutil` + `pynvml` monitoring. `HardwarePlanner` auto-selects load-time `quantization` / `device_map` / `max_memory` / `batch_size` for your GPU (see note below) |
 | **📝 Reports** | Interactive `report.html` + `report.json` + `report.csv` + per-benchmark `*.json` |
@@ -244,6 +247,10 @@ Search acceleration:
   --max-weight-limit     max_weight ceiling (default: automatic — architecture profiles set a
                          family-specific value, e.g. 2.0 for Gemma; base 1.5)
   --direction-source     mean | median (robust to massive activations)
+  --input-side-ablation / --no-input-side-ablation  also ablate the paired read-side
+                         modules (attention Q/K/V, MLP gate/up)
+  --decay-kernel         linear | gaussian layer decay of the ablation weight
+  --kl-token-count N     average KL over the first N generated tokens (default: 1)
   --pruning / --no-pruning       early abandonment of dominated trials (default on)
   --search-seeds / --no-search-seeds   seed configs for fresh studies (default on)
 

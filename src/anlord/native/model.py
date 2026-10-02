@@ -66,6 +66,45 @@ class AbliterationParameters:
     min_weight_distance: float
 
 
+def write_side_delta(W: Tensor, v: Tensor, weight: float) -> Tensor:
+    """Delta W for a module that WRITES to the residual stream.
+
+    W: [out, in]; v: direction in output space [out]. Removes the v-component
+    of the module output: W'x = Wx - weight * v (v^T W x)."""
+    return -weight * torch.outer(v, W.T @ v)
+
+
+def read_side_delta(W: Tensor, v: Tensor, weight: float) -> Tensor:
+    """Delta W for a module that READS from the residual stream.
+
+    W: [out, in]; v: direction in input space [in]. Removes the v-component
+    of the module input: W'x = W(x - weight * v (v^T x)). At weight 1 the
+    module becomes blind to the direction: W'v = 0."""
+    return -weight * torch.outer(W @ v, v)
+
+
+def ablation_weight(
+    max_weight: float,
+    min_weight: float,
+    distance: float,
+    min_weight_distance: float,
+    kernel: str = "linear",
+) -> float:
+    """Layer weight for the ablation, interpolated from max_weight at
+    max_weight_position down to min_weight over min_weight_distance.
+
+    "linear" is the classic ramp; "gaussian" falls off smoothly around
+    max_weight_position (sigma = min_weight_distance)."""
+    if kernel == "gaussian":
+        sigma = max(min_weight_distance, 1.0)
+        return min_weight + (max_weight - min_weight) * math.exp(
+            -0.5 * (distance / sigma) ** 2
+        )
+    return max_weight + (distance / max(min_weight_distance, 1e-9)) * (
+        min_weight - max_weight
+    )
+
+
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
@@ -77,6 +116,12 @@ class Model:
     def __init__(self, settings: NativeConfig):
         self.settings = settings
         self.needs_reload = False
+        self.steering_mode = getattr(settings, "steering_mode", "lora")
+        if self.steering_mode == "direct" and settings.quantization != QuantizationMethod.NONE:
+            raise Exception(
+                "Direct steering requires quantization none: the base weights must be loaded "
+                "in BF16/FP16 to be editable in place (BnB/MXFP4 formats are read-only)."
+            )
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
@@ -204,7 +249,10 @@ class Model:
                     "(e.g. 'attn')."
                 )
 
-        self._apply_lora()
+        if self.steering_mode == "direct":
+            print("* Direct steering mode: editing base weights in place (no LoRA adapters)")
+        else:
+            self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -357,7 +405,30 @@ class Model:
           resets LoRA adapter weights to zero (identity transformation).
         - Slow path: If switching models or after merge_and_unload(),
           performs full model reload with quantization config.
+        - Direct steering: reloads the pristine weights from disk (exact state
+          every trial; a delta-journal restore would drift in bf16).
         """
+        if self.steering_mode == "direct":
+            self.model = None
+            empty_cache()
+            quantization_config = self._get_quantization_config(
+                str(self.dtype).split(".")[-1]
+            )
+            extra_kwargs = {}
+            if quantization_config is not None:
+                extra_kwargs["quantization_config"] = quantization_config
+            self.model = get_model_class(self.settings.model).from_pretrained(
+                self.settings.model,
+                dtype=self.dtype,
+                device_map=self.settings.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=True
+                if self.settings.model in self.trusted_models
+                else None,
+                **self.revision_kwargs,
+                **extra_kwargs,
+            )
+            return
 
         # If a prior model load was interrupted/cancelled mid-process, self.model will be None.
         current_model = None
@@ -480,6 +551,28 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
+        # Input-side modules (1.6.0): read from the residual stream. Grouped so
+        # Q/K/V and gate/up share one search component each; the "_in" suffix
+        # marks the read-side delta math in abliterate().
+        if getattr(self.settings, "abliteration_input_side", False):
+            qkv = []
+            with suppress(Exception):
+                qkv.append(layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
+            with suppress(Exception):
+                qkv.append(layer.self_attn.k_proj)  # ty:ignore[possibly-missing-attribute]
+            with suppress(Exception):
+                qkv.append(layer.self_attn.v_proj)  # ty:ignore[possibly-missing-attribute]
+            gate_up = []
+            with suppress(Exception):
+                gate_up.extend([layer.mlp.gate_proj, layer.mlp.up_proj])  # ty:ignore[possibly-missing-attribute]
+            with suppress(Exception):
+                for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
+                    gate_up.extend([expert.gate_proj, expert.up_proj])  # ty:ignore[possibly-missing-attribute]
+            for qkv_module in qkv:
+                try_add("attn.qkv_in", qkv_module)
+            for gate_up_module in gate_up:
+                try_add("mlp.gateup_in", gate_up_module)
+
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
         assert total_modules > 0, "No abliterable modules found in layer"
@@ -568,10 +661,14 @@ class Model:
                 if distance > params.min_weight_distance:
                     continue
 
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
-                weight = params.max_weight + (distance / params.min_weight_distance) * (
-                    params.min_weight - params.max_weight
+                # Interpolate the weight between max_weight and min_weight
+                # over min_weight_distance (linear or gaussian decay).
+                weight = ablation_weight(
+                    params.max_weight,
+                    params.min_weight,
+                    distance,
+                    params.min_weight_distance,
+                    getattr(self.settings, "decay_kernel", "linear"),
                 )
 
                 # Resolve refusal direction(s) for this layer
@@ -595,6 +692,34 @@ class Model:
                     layer_vectors = None
 
                 for module in modules:
+                    if getattr(self.settings, "steering_mode", "lora") == "direct":
+                        # Direct steering (1.6.0): apply the delta straight to the
+                        # base weight (no rank constraint, exact materialization -
+                        # required for Gemma-4-style PLE / multi-norm inputs) and
+                        # journal it for the per-trial restore.
+                        raw = module.weight.data
+                        W32 = raw.to(torch.float32).view(raw.shape[0], -1)
+                        if is_subspace:
+                            vecs = (
+                                [refusal_direction]
+                                if layer_vectors is None
+                                else [layer_vectors[i] for i in range(layer_vectors.shape[0])]
+                            )
+                        else:
+                            vecs = [layer_refusal_direction]
+                        vecs = [v.to(W32.device).view(-1) for v in vecs]
+                        per = weight / max(1, len(vecs))
+                        pairs = []
+                        delta = torch.zeros_like(W32)
+                        for v in vecs:
+                            if component.endswith("_in"):
+                                a, b = W32 @ v, v
+                            else:
+                                a, b = v, W32.T @ v
+                            pairs.append((a, b))
+                            delta = delta - per * torch.outer(a, b)
+                        raw.add_(delta.to(raw.dtype))
+                        continue
                     module = cast(Linear, module)
 
                     # Get W (dequantize if necessary).
@@ -613,6 +738,41 @@ class Model:
                         )
 
                     W = W.view(W.shape[0], -1)
+
+                    if component.endswith("_in"):
+                        # Read-side ablation (1.6.0): remove the direction from
+                        # the module INPUT (W' = W - w (Wv)v^T). Row-norm
+                        # preservation is write-side semantics and is not
+                        # applied to read-side modules.
+                        if is_subspace:
+                            vecs = (
+                                [refusal_direction]
+                                if layer_vectors is None
+                                else [layer_vectors[i] for i in range(layer_vectors.shape[0])]
+                            )
+                            per = weight / max(1, len(vecs))
+                            delta = torch.zeros_like(W)
+                            for vec in vecs:
+                                vv = vec.to(module.weight.device).view(-1, 1)
+                                delta = delta - per * torch.outer(W @ vv, vv)
+                            if delta.abs().max().item() == 0:
+                                lora_A = torch.zeros(1, W.shape[1], device=W.device, dtype=W.dtype)
+                                lora_B = torch.zeros(W.shape[0], 1, device=W.device, dtype=W.dtype)
+                            else:
+                                torch.manual_seed(self.settings.seed)
+                                U, S, Vh = torch.svd_lowrank(delta, q=6, niter=4)
+                                sqrt_S = torch.sqrt(S[:1].clamp(min=1e-12))
+                                lora_B = U[:, :1] @ torch.diag(sqrt_S)
+                                lora_A = sqrt_S.view(1, -1) * Vh[:1, :]
+                        else:
+                            v = layer_refusal_direction.to(module.weight.device).view(-1, 1)
+                            lora_A = v.view(1, -1)
+                            lora_B = -weight * (W @ v)
+                        weight_A = cast(Tensor, module.lora_A["default"].weight)
+                        weight_B = cast(Tensor, module.lora_B["default"].weight)
+                        weight_A.data = lora_A.to(weight_A.dtype)
+                        weight_B.data = lora_B.to(weight_B.dtype)
+                        continue
 
                     if self.settings.row_normalization != RowNormalization.NONE:
                         W_org = W
@@ -983,6 +1143,37 @@ class Model:
             logits.append(self.get_logits(batch))
 
         return torch.cat(logits, dim=0)
+
+    def get_logits_multi(self, prompts: list[Prompt], token_count: int = 1) -> Tensor:
+        """Raw logits for the first `token_count` generated tokens: [T, B, V]."""
+        _, outputs = self.generate(
+            prompts,
+            max_new_tokens=token_count,
+            output_logits=True,
+            return_dict_in_generate=True,
+            use_cache=False,
+        )
+
+        # This cast is valid because GenerateDecoderOnlyOutput is the return type
+        # of model.generate with return_dict_in_generate=True.
+        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+        logits = cast(tuple[FloatTensor], outputs.logits)
+        stacked = torch.stack([chunk.float() for chunk in logits], dim=0)
+
+        if self.settings.offload_outputs_to_cpu:
+            del outputs, logits
+            stacked = stacked.cpu()
+            empty_cache()
+
+        return stacked
+
+    def get_logits_multi_batched(self, prompts: list[Prompt], token_count: int = 1) -> Tensor:
+        chunks = []
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            chunks.append(self.get_logits_multi(batch, token_count))
+
+        return torch.cat(chunks, dim=1)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
         # This cast is valid because str is the return type

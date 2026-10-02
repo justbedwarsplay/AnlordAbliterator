@@ -293,6 +293,44 @@ Examples:
     )
 
     # Benchmark configuration
+    abliteration_group.add_argument(
+        "--input-side-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also ablate the paired read-side modules (attention Q/K/V, MLP gate/up) with the "
+        "same per-layer weight as their write-side counterpart - lower KL at equal refusal "
+        "reduction",
+    )
+    abliteration_group.add_argument(
+        "--steering-mode",
+        choices=["lora", "direct"],
+        default="lora",
+        help="How the ablation is applied: lora (reversible adapters, merged on export) or "
+        "direct (in-place weight editing; required for Gemma-4-style PLE/multi-norm "
+        "architectures; requires --quantization none)",
+    )
+    abliteration_group.add_argument(
+        "--winsorization-quantile",
+        type=float,
+        default=None,
+        help="Clamp residual activations at this quantile before extracting the refusal "
+        "direction (robust against massive activations; Gemma family benefits, e.g. 0.995). "
+        "1 = disabled",
+    )
+    abliteration_group.add_argument(
+        "--kl-token-count",
+        type=int,
+        default=None,
+        help="Average the KL divergence over the first N generated token positions "
+        "instead of just the first one (default: 1, classic first-token KL)",
+    )
+    abliteration_group.add_argument(
+        "--decay-kernel",
+        choices=["linear", "gaussian"],
+        default="linear",
+        help="Layer decay profile for the ablation weight: linear ramp (classic) or gaussian "
+        "(smoother falloff around max_weight_position)",
+    )
     benchmark_group = parser.add_argument_group("Benchmark Configuration")
     benchmark_group.add_argument(
         "--tasks",
@@ -477,6 +515,15 @@ def run_from_args(args: argparse.Namespace) -> Settings:
         abliteration_max_weight_limit=getattr(args, "max_weight_limit", None),
         abliteration_trial_select_top=getattr(args, "select_trial_top", 0) or 0,
         abliteration_direction_source=getattr(args, "direction_source", "mean"),
+        abliteration_input_side=getattr(args, "input_side_ablation", False),
+        abliteration_decay_kernel=getattr(args, "decay_kernel", "linear"),
+        abliteration_kl_token_count=getattr(args, "kl_token_count", None),
+        steering_mode=getattr(args, "steering_mode", "lora"),
+        winsorization_quantile=(
+            getattr(args, "winsorization_quantile", None)
+            if getattr(args, "winsorization_quantile", None) is not None
+            else 1.0
+        ),
         abliteration_pruning=getattr(args, "pruning", True),
         search_seeds=getattr(args, "search_seeds", True),
         staged_search=getattr(args, "staged_search", False),
