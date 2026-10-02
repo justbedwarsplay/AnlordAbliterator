@@ -1314,6 +1314,8 @@ class NativeAbliterator:
                                 f"  * [yellow]Pruned after KL step: KL {kl_value:.4f} is above the "
                                 f"zero-refusal front point ({min(zero_refusal_kls):.4f})[/]"
                             )
+                            if _TPE_PRUNED_PATCH_OK:
+                                raise TrialPruned()
                             raise MultiFidelityPrunedSignal()
                         total = evaluator.refusal_prompt_total()
                         for step_index, k in enumerate(pruning_schedule):
@@ -1345,6 +1347,8 @@ class NativeAbliterator:
                                     f"(refusals {refusals_f}, KL {kl_f:.4f})[/]"
                                 )
                                 trial.set_user_attr("pruned_at", k)
+                                if _TPE_PRUNED_PATCH_OK:
+                                    raise TrialPruned()
                                 raise MultiFidelityPrunedSignal()
 
             scores = evaluator.get_scores()
